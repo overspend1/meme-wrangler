@@ -3,19 +3,30 @@ services:
     image: postgres:15
     container_name: meme-wrangler-db
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
       - POSTGRES_DB=${POSTGRES_DB}
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-meme} -d ${POSTGRES_DB:-meme_wrangler}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
   meme-wrangler:
     build: .
     container_name: meme-wrangler
     restart: unless-stopped
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - OWNER_ID=${OWNER_ID}
