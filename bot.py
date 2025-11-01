@@ -30,31 +30,41 @@ if TYPE_CHECKING:
     from telegram import Update, Message, InputFile
     from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 else:
-    Update = Message = InputFile = Any  # type: ignore
-    ContextTypes = SimpleNamespace(DEFAULT_TYPE=Any)  # type: ignore
+    try:
+        from telegram import Update, Message, InputFile  # type: ignore
+        from telegram.ext import (  # type: ignore
+            ApplicationBuilder,
+            ContextTypes,
+            CommandHandler,
+            MessageHandler,
+            filters,
+        )
+    except ModuleNotFoundError:
+        Update = Message = InputFile = Any  # type: ignore
+        ContextTypes = SimpleNamespace(DEFAULT_TYPE=Any)  # type: ignore
 
-    class _MissingTelegramModule:
-        """Lazily raise when Telegram features are used without dependency."""
+        class _MissingTelegramModule:
+            """Lazily raise when Telegram features are used without dependency."""
 
-        def __getattr__(self, item):
-            raise RuntimeError(
-                "python-telegram-bot must be installed to use the Meme Wrangler bot (missing telegram module)."
-            )
+            def __getattr__(self, item):
+                raise RuntimeError(
+                    "python-telegram-bot must be installed to use the Meme Wrangler bot (missing telegram module)."
+                )
 
-        def __call__(self, *args, **kwargs):
-            raise RuntimeError(
-                "python-telegram-bot must be installed to use the Meme Wrangler bot (missing telegram module)."
-            )
+            def __call__(self, *args, **kwargs):
+                raise RuntimeError(
+                    "python-telegram-bot must be installed to use the Meme Wrangler bot (missing telegram module)."
+                )
 
-    ApplicationBuilder = CommandHandler = MessageHandler = _MissingTelegramModule()  # type: ignore
+        ApplicationBuilder = CommandHandler = MessageHandler = _MissingTelegramModule()  # type: ignore
 
-    class _MissingFilters(SimpleNamespace):
-        def __getattr__(self, item):
-            raise RuntimeError(
-                "python-telegram-bot must be installed to use the Meme Wrangler bot (missing telegram filters)."
-            )
+        class _MissingFilters(SimpleNamespace):
+            def __getattr__(self, item):
+                raise RuntimeError(
+                    "python-telegram-bot must be installed to use the Meme Wrangler bot (missing telegram filters)."
+                )
 
-    filters = _MissingFilters()  # type: ignore
+        filters = _MissingFilters()  # type: ignore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
