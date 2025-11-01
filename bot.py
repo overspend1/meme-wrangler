@@ -151,7 +151,12 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
 # Support multiple owner IDs (comma-separated)
 _owner_ids_raw = os.environ.get("OWNER_ID", "0")
-OWNER_IDS = set(int(oid.strip()) for oid in _owner_ids_raw.split(",") if oid.strip())
+try:
+    OWNER_IDS = set(int(oid.strip()) for oid in _owner_ids_raw.split(",") if oid.strip())
+    logger.info(f"Configured owner IDs: {OWNER_IDS}")
+except ValueError as e:
+    logger.error(f"Failed to parse OWNER_ID env var '{_owner_ids_raw}': {e}")
+    OWNER_IDS = {0}
 
 CHANNEL_ID = os.environ.get("CHANNEL_ID")  # @channelusername or -100<id>
 BACKUP_DIR = Path(os.environ.get("MEMEBOT_BACKUP_DIR", "backups"))
