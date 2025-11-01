@@ -4,23 +4,33 @@ services:
     container_name: meme-wrangler-db
     restart: unless-stopped
     environment:
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB:-meme_wrangler}
+      - POSTGRES_USER=${POSTGRES_USER:-meme}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-meme}
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-meme} -d ${POSTGRES_DB:-meme_wrangler}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
   meme-wrangler:
     build: .
     container_name: meme-wrangler
     restart: unless-stopped
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     environment:
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-      - OWNER_ID=${OWNER_ID}
-      - CHANNEL_ID=${CHANNEL_ID}
-      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - OWNER_ID=${OWNER_ID:-}
+      - CHANNEL_ID=${CHANNEL_ID:-}
+      - POSTGRES_DB=${POSTGRES_DB:-meme_wrangler}
+      - POSTGRES_USER=${POSTGRES_USER:-meme}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-meme}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-meme}:${POSTGRES_PASSWORD:-meme}@postgres:5432/${POSTGRES_DB:-meme_wrangler}
       - MEMEBOT_BACKUP_DIR=/app/backups
     volumes:
       - ./backups:/app/backups
