@@ -3,6 +3,8 @@ services:
     image: postgres:15
     container_name: meme-wrangler-db
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
       - POSTGRES_DB=${POSTGRES_DB:-meme_wrangler}
       - POSTGRES_USER=${POSTGRES_USER:-meme}
@@ -23,6 +25,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - OWNER_ID=${OWNER_ID:-}
