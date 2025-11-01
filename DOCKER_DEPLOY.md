@@ -46,6 +46,13 @@ Fill in your actual values:
 TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 OWNER_ID=987654321
 CHANNEL_ID=@yourchannel
+POSTGRES_DB=meme_wrangler
+POSTGRES_USER=meme
+POSTGRES_PASSWORD=meme
+# Optional: hash (SHA-256) for replacing the baked-in backup secret
+# MEMEBOT_BACKUP_PASSWORD_HASH=<your_sha256_hash>
+# Optional: adjust DATABASE_URL for non-compose workflows
+# DATABASE_URL=postgresql://meme:meme@postgres:5432/meme_wrangler
 ```
 
 ### 2. Build and Run with Docker Compose (Easiest)
@@ -77,17 +84,33 @@ docker build -t meme-wrangler .
 ### Run the Container
 
 ```bash
-# Create data directory for database persistence
-mkdir -p ./data
+# Create a dedicated network and PostgreSQL volume
+docker network create meme-wrangler || true
+docker volume create meme_pgdata
+
+# Start PostgreSQL
+docker run -d \
+  --name meme-wrangler-db \
+  --network meme-wrangler \
+  --restart unless-stopped \
+  -e POSTGRES_DB="meme_wrangler" \
+  -e POSTGRES_USER="meme" \
+  -e POSTGRES_PASSWORD="meme" \
+  -v meme_pgdata:/var/lib/postgresql/data \
+  postgres:15
 
 # Run the bot (replace with your actual values)
+mkdir -p ./backups
 docker run -d \
   --name meme-wrangler \
+  --network meme-wrangler \
   --restart unless-stopped \
   -e TELEGRAM_BOT_TOKEN="your_token_here" \
   -e OWNER_ID="your_id_here" \
   -e CHANNEL_ID="@your_channel" \
-  -v $(pwd)/data:/app/data \
+  -e DATABASE_URL="postgresql://meme:meme@meme-wrangler-db:5432/meme_wrangler" \
+  -e MEMEBOT_BACKUP_DIR=/app/backups \
+  -v $(pwd)/backups:/app/backups \
   meme-wrangler
 ```
 
@@ -153,11 +176,14 @@ docker push yourusername/meme-wrangler:latest
 docker pull yourusername/meme-wrangler:latest
 docker run -d \
   --name meme-wrangler \
+  --network meme-wrangler \
   --restart unless-stopped \
   -e TELEGRAM_BOT_TOKEN="your_token" \
   -e OWNER_ID="your_id" \
   -e CHANNEL_ID="@channel" \
-  -v ~/meme-wrangler-data:/app/data \
+  -e DATABASE_URL="postgresql://meme:meme@meme-wrangler-db:5432/meme_wrangler" \
+  -e MEMEBOT_BACKUP_DIR=/app/backups \
+  -v ~/meme-wrangler-backups:/app/backups \
   yourusername/meme-wrangler:latest
 ```
 
@@ -185,21 +211,24 @@ docker build -t meme-wrangler .
 # Run new container
 docker run -d \
   --name meme-wrangler \
+  --network meme-wrangler \
   --restart unless-stopped \
   -e TELEGRAM_BOT_TOKEN="your_token" \
   -e OWNER_ID="your_id" \
   -e CHANNEL_ID="@channel" \
-  -v $(pwd)/data:/app/data \
+  -e DATABASE_URL="postgresql://meme:meme@meme-wrangler-db:5432/meme_wrangler" \
+  -e MEMEBOT_BACKUP_DIR=/app/backups \
+  -v $(pwd)/backups:/app/backups \
   meme-wrangler
 ```
 
 ## Data Persistence
 
-The database file (`memes.db`) is stored in the `./data` directory on your host machine, which is mounted as a volume in the container. This means:
+The Compose stack provisions a PostgreSQL container whose data files live in the `pgdata` named volume. Backup exports created with the `/backup` command are written to the `./backups` directory on the host.
 
-- ✅ Your scheduled memes persist even if you stop/restart the container
-- ✅ You can backup the database by copying the `./data` folder
-- ✅ You can inspect the database from your host machine
+- ✅ Your scheduled memes persist even if you stop/restart the containers
+- ✅ Copy the `./backups` directory for JSON exports or run `/backup` on demand before deployments
+- ✅ You can connect to the PostgreSQL service (`postgres:5432`) with your favorite tools for inspections
 
 ## Troubleshooting
 

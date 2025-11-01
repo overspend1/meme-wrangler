@@ -17,14 +17,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the bot code
 COPY bot.py .
 
-# Create directory for database
-RUN mkdir -p /app/data
+# Create directory for backups
+RUN mkdir -p /app/backups
 
 # Set environment variables (will be overridden by docker-compose or run command)
 ENV TELEGRAM_BOT_TOKEN=""
 ENV OWNER_ID=""
 ENV CHANNEL_ID=""
-ENV MEMEBOT_DB="/app/data/memes.db"
+ENV DATABASE_URL=""
+ENV MEMEBOT_BACKUP_DIR="/app/backups"
 
 # Run the bot
 CMD ["python", "bot.py"]

@@ -13,6 +13,7 @@ The easiest way to run the bot is using Docker:
    cp .env.example .env
    nano .env  # Edit with your bot credentials
    ```
+   The compose stack expects PostgreSQL credentials, so populate `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` (defaults provided). Backups are protected by a built-in SHA-256 hash; optionally define `MEMEBOT_BACKUP_PASSWORD_HASH` to replace it.
 
 2. **Run with Docker Compose:**
    ```bash
@@ -41,15 +42,21 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-2. Set environment variables:
+2. Provision a PostgreSQL database (local Docker container or managed instance) and note the connection string.
+
+3. Set environment variables:
 
 ```bash
 export TELEGRAM_BOT_TOKEN=123:ABC
 export OWNER_ID=123456789
 export CHANNEL_ID=@yourchannel  # or -1001234567890
+export DATABASE_URL=postgresql://meme:meme@localhost:5432/meme_wrangler
+# Optional: where JSON backups are written
+# export MEMEBOT_BACKUP_DIR=/path/to/backups
+# export MEMEBOT_BACKUP_PASSWORD_HASH=<sha256 hash of your backup secret>
 ```
 
-3. Run the bot:
+4. Run the bot:
 
 ```bash
 python bot.py
@@ -66,8 +73,8 @@ python bot.py
 This project includes full Docker support for easy deployment:
 
 - **Dockerfile**: Creates a lightweight Python container with all dependencies
-- **docker-compose.yml**: Simplifies running the bot with proper configuration
-- **Volume mounting**: Database persists between container restarts in `./data` directory
+- **docker-compose.yml**: Simplifies running the bot alongside PostgreSQL with coordinated configuration
+- **Persistent storage**: `pgdata` volume keeps the database cluster while `./backups` stores exported JSON backups
 - **Auto-restart**: Container automatically restarts if it crashes
 - **Logging**: Configured with log rotation (10MB max, 3 files)
 
@@ -78,4 +85,6 @@ The Docker implementation ensures consistent behavior across different environme
 -   All times are in **IST (India Standard Time, UTC+5:30)** regardless of the server's timezone.
 -   Stored timestamps are Unix timestamps (UTC).
 -   Make sure the bot is admin in the channel to post messages.
--   When using Docker, the database is stored in `./data/memes.db` on the host machine.
+-   When using Docker Compose, PostgreSQL data lives in the `pgdata` volume and JSON backups are written to `./backups/`.
+-   Use `/backup <secret>` to export the full meme catalog (scheduled + posted) and `/restore <secret>` (replying to a backup file) to import it again. Validation happens against a baked-in SHA-256 hash; override `MEMEBOT_BACKUP_PASSWORD_HASH` if you need to supply your own hash.
+-   Every new meme DM automatically triggers a fresh JSON backup stored under `./backups/` (Compose) or the directory pointed to `MEMEBOT_BACKUP_DIR`.
