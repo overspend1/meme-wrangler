@@ -10,10 +10,10 @@ The easiest way to run the bot is using Docker:
 
 1. **Set up environment variables:**
    ```bash
-   cp .env.example .env
-   nano .env  # Edit with your bot credentials
+   cp .env.example .ENV
+   nano .ENV  # Edit with your bot credentials
    ```
-   The compose stack expects PostgreSQL credentials, so populate `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` (defaults provided). Backups are protected by a built-in SHA-256 hash; optionally define `MEMEBOT_BACKUP_PASSWORD_HASH` to replace it.
+   By default the compose file reads values from `compose.env` so it can boot without secrets. To keep credentials out of version control, point the stack at your own file by exporting `COMPOSE_ENV_FILE` before running Compose (e.g. `COMPOSE_ENV_FILE=.ENV docker compose up -d`). Populate `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` (defaults provided). Backups are protected by a built-in SHA-256 hash; optionally define `MEMEBOT_BACKUP_PASSWORD_HASH` to replace it.
 
 2. **Run with Docker Compose:**
    ```bash
@@ -24,6 +24,8 @@ The easiest way to run the bot is using Docker:
    ```bash
    docker-compose logs -f
    ```
+
+   Deploying via Portainer? Upload your `.ENV` file under **Environment variables** and set `COMPOSE_ENV_FILE=.ENV` so the stack loads it automatically.
 
 4. **Stop the bot:**
    ```bash

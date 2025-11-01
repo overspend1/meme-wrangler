@@ -1,32 +1,8 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-.venv/
-venv/
-ENV/
-
-# Database
-*.db
-*.db-journal
-
-# Environment variables
+.git
+.gitignore
+__pycache__
+*.pyc
+backups
 .env
-
-# IDEs
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-
-# Docker
-data/
+.env.*
+.ENV
