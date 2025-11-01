@@ -123,14 +123,11 @@ def _normalize_database_url(url: str) -> str:
     if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
         return url
 
-    username = parsed.username or ""
-    password = parsed.password
-    auth = ""
-    if username:
-        auth = username
-        if password is not None:
-            auth += f":{password}"
-        auth += "@"
+    if "@" in parsed.netloc:
+        auth_prefix, _, _ = parsed.netloc.rpartition("@")
+        auth_segment = f"{auth_prefix}@"
+    else:
+        auth_segment = ""
 
     if parsed.port is not None:
         port_fragment = f":{parsed.port}"
@@ -138,7 +135,11 @@ def _normalize_database_url(url: str) -> str:
         port_env = os.environ.get("POSTGRES_PORT")
         port_fragment = f":{port_env}" if port_env else ""
 
-    new_netloc = f"{auth}{host_override}{port_fragment}"
+    target_host = host_override
+    if ":" in target_host and not target_host.startswith("["):
+        target_host = f"[{target_host}]"
+
+    new_netloc = f"{auth_segment}{target_host}{port_fragment}"
     rebuilt = parsed._replace(netloc=new_netloc)
     return urlunparse(rebuilt)
 
