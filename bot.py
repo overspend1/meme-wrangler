@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import os
+from urllib.parse import urlparse, urlunparse
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -89,7 +90,63 @@ def _ensure_ist(dt: datetime) -> datetime:
         return _ist_localize(dt)
     return dt.astimezone(IST)
 
-DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("MEMEBOT_DB")
+def _build_database_url() -> Optional[str]:
+    """Derive the database URL from explicit env vars or component pieces."""
+
+    raw_url = os.environ.get("DATABASE_URL") or os.environ.get("MEMEBOT_DB")
+    if not raw_url:
+        user = os.environ.get("POSTGRES_USER")
+        password = os.environ.get("POSTGRES_PASSWORD")
+        db_name = os.environ.get("POSTGRES_DB")
+        host = os.environ.get("POSTGRES_HOST", "localhost")
+        port = os.environ.get("POSTGRES_PORT", "5432")
+        if user and password and db_name:
+            raw_url = (
+                f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}"
+                f"@{host}:{port}/{db_name}"
+            )
+    if raw_url:
+        return _normalize_database_url(raw_url)
+    return None
+
+
+def _normalize_database_url(url: str) -> str:
+    """Replace localhost hosts with the configured Postgres host for container runs."""
+
+    host_override = os.environ.get("POSTGRES_HOST")
+    if not host_override:
+        return url
+
+    host_override = host_override.strip()
+    if not host_override or host_override in {"localhost", "127.0.0.1", "::1"}:
+        return url
+
+    parsed = urlparse(url)
+    if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        return url
+
+    if "@" in parsed.netloc:
+        auth_prefix, _, _ = parsed.netloc.rpartition("@")
+        auth_segment = f"{auth_prefix}@"
+    else:
+        auth_segment = ""
+
+    if parsed.port is not None:
+        port_fragment = f":{parsed.port}"
+    else:
+        port_env = os.environ.get("POSTGRES_PORT")
+        port_fragment = f":{port_env}" if port_env else ""
+
+    target_host = host_override
+    if ":" in target_host and not target_host.startswith("["):
+        target_host = f"[{target_host}]"
+
+    new_netloc = f"{auth_segment}{target_host}{port_fragment}"
+    rebuilt = parsed._replace(netloc=new_netloc)
+    return urlunparse(rebuilt)
+
+
+DATABASE_URL = _build_database_url()
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 CHANNEL_ID = os.environ.get("CHANNEL_ID")  # @channelusername or -100<id>

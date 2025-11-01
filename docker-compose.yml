@@ -36,7 +36,9 @@ services:
       - POSTGRES_DB=${POSTGRES_DB:-meme_wrangler}
       - POSTGRES_USER=${POSTGRES_USER:-meme}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-meme}
-      - DATABASE_URL=${DATABASE_URL:-postgresql://${POSTGRES_USER:-meme}:${POSTGRES_PASSWORD:-meme}@postgres:5432/${POSTGRES_DB:-meme_wrangler}}
+      - POSTGRES_HOST=${POSTGRES_HOST:-postgres}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - DATABASE_URL=${DATABASE_URL:-postgresql://${POSTGRES_USER:-meme}:${POSTGRES_PASSWORD:-meme}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-meme_wrangler}}
       - MEMEBOT_BACKUP_DIR=${MEMEBOT_BACKUP_DIR:-/app/backups}
     volumes:
       - ./backups:/app/backups

@@ -13,7 +13,7 @@ The easiest way to run the bot is using Docker:
    cp .ENV.example .ENV
    nano .ENV  # Edit with your bot credentials
    ```
-   The compose file now looks for `.ENV` by default so Portainer and other orchestrators can supply secrets without additional flags. Copy `.ENV.example` to `.ENV`, then populate `TELEGRAM_BOT_TOKEN`, `OWNER_ID`, `CHANNEL_ID`, and the Postgres settings. You can still point the stack at a different file by exporting `COMPOSE_ENV_FILE` (e.g. `COMPOSE_ENV_FILE=staging.env docker compose up -d`). Backups are protected by a built-in SHA-256 hash; optionally define `MEMEBOT_BACKUP_PASSWORD_HASH` to replace it.
+   The compose file now looks for `.ENV` by default so Portainer and other orchestrators can supply secrets without additional flags. Copy `.ENV.example` to `.ENV`, then populate `TELEGRAM_BOT_TOKEN`, `OWNER_ID`, `CHANNEL_ID`, and the Postgres settings. Leave `POSTGRES_HOST=postgres` (and `POSTGRES_PORT=5432` unless your database listens elsewhere) when you run inside Docker. The bot rewrites any localhost URLs with that host so the container connects to the bundled PostgreSQL service instead of looping back on itself. You can still point the stack at a different file by exporting `COMPOSE_ENV_FILE` (e.g. `COMPOSE_ENV_FILE=staging.env docker compose up -d`). Backups are protected by a built-in SHA-256 hash; optionally define `MEMEBOT_BACKUP_PASSWORD_HASH` to replace it.
 
 2. **Run with Docker Compose:**
    ```bash
@@ -53,6 +53,9 @@ export TELEGRAM_BOT_TOKEN=123:ABC
 export OWNER_ID=123456789
 export CHANNEL_ID=@yourchannel  # or -1001234567890
 export DATABASE_URL=postgresql://meme:meme@localhost:5432/meme_wrangler
+# Optional pieces that mirror the Docker variables
+# export POSTGRES_HOST=localhost
+# export POSTGRES_PORT=5432
 # Optional: where JSON backups are written
 # export MEMEBOT_BACKUP_DIR=/path/to/backups
 # export MEMEBOT_BACKUP_PASSWORD_HASH=<sha256 hash of your backup secret>

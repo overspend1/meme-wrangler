@@ -49,6 +49,8 @@ CHANNEL_ID=@yourchannel
 POSTGRES_DB=meme_wrangler
 POSTGRES_USER=meme
 POSTGRES_PASSWORD=meme
+POSTGRES_HOST=postgres
+POSTGRES_PORT=5432
 # Optional: adjust which env file Compose should read (defaults to .ENV)
 # COMPOSE_ENV_FILE=staging.env
 # Optional: hash (SHA-256) for replacing the baked-in backup secret
@@ -56,6 +58,8 @@ POSTGRES_PASSWORD=meme
 # Optional: adjust DATABASE_URL for non-compose workflows
 # DATABASE_URL=postgresql://meme:meme@postgres:5432/meme_wrangler
 ```
+
+Leave `POSTGRES_HOST=postgres` when running through Docker Compose or Portainer; it's the internal service name that the bot rewrites into any localhost-style URLs so the container connects to the bundled PostgreSQL instance. Override it only if your database lives elsewhere.
 
 ### 2. Build and Run with Docker Compose (Easiest)
 
