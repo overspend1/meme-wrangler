@@ -1,4 +1,4 @@
-x-env-file: &compose_env_file ${COMPOSE_ENV_FILE:-compose.env}
+x-env-file: &compose_env_file ${COMPOSE_ENV_FILE:-.ENV}
 
 services:
   postgres:
