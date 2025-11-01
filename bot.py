@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import os
+from urllib.parse import urlparse, urlunparse
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,31 +31,41 @@ if TYPE_CHECKING:
     from telegram import Update, Message, InputFile
     from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 else:
-    Update = Message = InputFile = Any  # type: ignore
-    ContextTypes = SimpleNamespace(DEFAULT_TYPE=Any)  # type: ignore
+    try:
+        from telegram import Update, Message, InputFile  # type: ignore
+        from telegram.ext import (  # type: ignore
+            ApplicationBuilder,
+            ContextTypes,
+            CommandHandler,
+            MessageHandler,
+            filters,
+        )
+    except ModuleNotFoundError:
+        Update = Message = InputFile = Any  # type: ignore
+        ContextTypes = SimpleNamespace(DEFAULT_TYPE=Any)  # type: ignore
 
-    class _MissingTelegramModule:
-        """Lazily raise when Telegram features are used without dependency."""
+        class _MissingTelegramModule:
+            """Lazily raise when Telegram features are used without dependency."""
 
-        def __getattr__(self, item):
-            raise RuntimeError(
-                "python-telegram-bot must be installed to use the Meme Wrangler bot (missing telegram module)."
-            )
+            def __getattr__(self, item):
+                raise RuntimeError(
+                    "python-telegram-bot must be installed to use the Meme Wrangler bot (missing telegram module)."
+                )
 
-        def __call__(self, *args, **kwargs):
-            raise RuntimeError(
-                "python-telegram-bot must be installed to use the Meme Wrangler bot (missing telegram module)."
-            )
+            def __call__(self, *args, **kwargs):
+                raise RuntimeError(
+                    "python-telegram-bot must be installed to use the Meme Wrangler bot (missing telegram module)."
+                )
 
-    ApplicationBuilder = CommandHandler = MessageHandler = _MissingTelegramModule()  # type: ignore
+        ApplicationBuilder = CommandHandler = MessageHandler = _MissingTelegramModule()  # type: ignore
 
-    class _MissingFilters(SimpleNamespace):
-        def __getattr__(self, item):
-            raise RuntimeError(
-                "python-telegram-bot must be installed to use the Meme Wrangler bot (missing telegram filters)."
-            )
+        class _MissingFilters(SimpleNamespace):
+            def __getattr__(self, item):
+                raise RuntimeError(
+                    "python-telegram-bot must be installed to use the Meme Wrangler bot (missing telegram filters)."
+                )
 
-    filters = _MissingFilters()  # type: ignore
+        filters = _MissingFilters()  # type: ignore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -79,7 +90,60 @@ def _ensure_ist(dt: datetime) -> datetime:
         return _ist_localize(dt)
     return dt.astimezone(IST)
 
-DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("MEMEBOT_DB")
+def _build_database_url() -> Optional[str]:
+    """Derive the database URL from explicit env vars or component pieces."""
+
+    raw_url = os.environ.get("DATABASE_URL") or os.environ.get("MEMEBOT_DB")
+    if not raw_url:
+        user = os.environ.get("POSTGRES_USER")
+        password = os.environ.get("POSTGRES_PASSWORD")
+        db_name = os.environ.get("POSTGRES_DB")
+        host = os.environ.get("POSTGRES_HOST", "localhost")
+        port = os.environ.get("POSTGRES_PORT", "5432")
+        if user and password and db_name:
+            raw_url = f"postgresql://{user}:{password}@{host}:{port}/{db_name}"
+
+    if raw_url:
+        return _normalize_database_url(raw_url)
+    return None
+
+
+def _normalize_database_url(url: str) -> str:
+    """Replace localhost hosts with the configured Postgres host for container runs."""
+
+    host_override = os.environ.get("POSTGRES_HOST")
+    if not host_override:
+        return url
+
+    host_override = host_override.strip()
+    if not host_override or host_override in {"localhost", "127.0.0.1", "::1"}:
+        return url
+
+    parsed = urlparse(url)
+    if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        return url
+
+    username = parsed.username or ""
+    password = parsed.password
+    auth = ""
+    if username:
+        auth = username
+        if password is not None:
+            auth += f":{password}"
+        auth += "@"
+
+    if parsed.port is not None:
+        port_fragment = f":{parsed.port}"
+    else:
+        port_env = os.environ.get("POSTGRES_PORT")
+        port_fragment = f":{port_env}" if port_env else ""
+
+    new_netloc = f"{auth}{host_override}{port_fragment}"
+    rebuilt = parsed._replace(netloc=new_netloc)
+    return urlunparse(rebuilt)
+
+
+DATABASE_URL = _build_database_url()
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 CHANNEL_ID = os.environ.get("CHANNEL_ID")  # @channelusername or -100<id>
