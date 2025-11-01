@@ -13,6 +13,7 @@ COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir python-telegram-bot==20.7
 
 # Copy the bot code
 COPY bot.py .
