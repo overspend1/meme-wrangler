@@ -101,8 +101,10 @@ def _build_database_url() -> Optional[str]:
         host = os.environ.get("POSTGRES_HOST", "localhost")
         port = os.environ.get("POSTGRES_PORT", "5432")
         if user and password and db_name:
-            raw_url = f"postgresql://{user}:{password}@{host}:{port}/{db_name}"
-
+            raw_url = (
+                f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}"
+                f"@{host}:{port}/{db_name}"
+            )
     if raw_url:
         return _normalize_database_url(raw_url)
     return None
