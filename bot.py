@@ -859,7 +859,7 @@ async def scheduleat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         raise SystemExit("Please set TELEGRAM_BOT_TOKEN environment variable")
-    if not OWNER_ID or OWNER_ID == 0:
+    if not OWNER_IDS or 0 in OWNER_IDS:
         raise SystemExit("Please set OWNER_ID environment variable to your Telegram user id")
     if not CHANNEL_ID:
         raise SystemExit("Please set CHANNEL_ID to target channel (username or id)")
