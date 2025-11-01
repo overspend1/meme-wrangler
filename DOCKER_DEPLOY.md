@@ -37,8 +37,8 @@ sudo usermod -aG docker $USER
 Copy the example file and edit it:
 
 ```bash
-cp .env.example .env
-nano .env  # or use any text editor
+cp .ENV.example .ENV
+nano .ENV  # or use any text editor
 ```
 
 Fill in your actual values:
@@ -49,6 +49,8 @@ CHANNEL_ID=@yourchannel
 POSTGRES_DB=meme_wrangler
 POSTGRES_USER=meme
 POSTGRES_PASSWORD=meme
+# Optional: adjust which env file Compose should read (defaults to .ENV)
+# COMPOSE_ENV_FILE=staging.env
 # Optional: hash (SHA-256) for replacing the baked-in backup secret
 # MEMEBOT_BACKUP_PASSWORD_HASH=<your_sha256_hash>
 # Optional: adjust DATABASE_URL for non-compose workflows
@@ -58,7 +60,7 @@ POSTGRES_PASSWORD=meme
 ### 2. Build and Run with Docker Compose (Easiest)
 
 ```bash
-# Build and start in background
+# Build and start in background (stack reads .ENV automatically)
 docker-compose up -d
 
 # View logs
@@ -72,6 +74,10 @@ docker-compose restart
 ```
 
 That's it! Your bot is now running in Docker! 🎉
+
+#### Deploying with Portainer Stacks
+
+When launching the stack from Portainer, upload your `.ENV` file through the **Environment variables** tab—Portainer saves it beside the stack as `/data/compose/<stack-id>/.ENV`, which matches the default expected by `docker-compose.yml`. Only set `COMPOSE_ENV_FILE` if you deliberately use a different name.
 
 ## Alternative: Using Docker Commands Directly
 
@@ -152,9 +158,9 @@ ssh -i /path/to/ssh_key username@server_ip
 # Navigate to bot directory
 cd ~/meme-wrangler
 
-# Create .env file
-cp .env.example .env
-nano .env  # Fill in your credentials
+# Create .ENV file
+cp .ENV.example .ENV
+nano .ENV  # Fill in your credentials
 
 # Build and run
 docker-compose up -d
@@ -308,8 +314,8 @@ scp -i /path/to/key -r \
 ssh -i /path/to/key username@server_ip
 cd ~/memebot
 
-# Create .env file
-nano .env  # Add your credentials
+# Create .ENV file
+nano .ENV  # Add your credentials
 
 # Run with Docker Compose
 docker-compose up -d

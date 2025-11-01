@@ -26,16 +26,20 @@ if [ -z "$SERVER" ]; then
     exit 1
 fi
 
-echo "Step 1: Checking if .env file exists..."
-if [ ! -f ".env" ]; then
-    echo "Error: .env file not found!"
-    echo "Please create .env file with your credentials:"
-    echo "  cp .env.example .env"
-    echo "  nano .env"
+ENV_FILE=".ENV"
+echo "Step 1: Checking for environment file (.ENV or .env)..."
+if [ -f "$ENV_FILE" ]; then
+    echo "✓ .ENV file found"
+elif [ -f ".env" ]; then
+    ENV_FILE=".env"
+    echo "✓ .env file found"
+else
+    echo "Error: No environment file found!"
+    echo "Please create one with your credentials:"
+    echo "  cp .ENV.example .ENV"
+    echo "  nano .ENV"
     exit 1
 fi
-
-echo "✓ .env file found"
 echo ""
 
 echo "Step 2: Uploading files to server..."
@@ -45,7 +49,7 @@ scp -i "$SSH_KEY" \
     docker-compose.yml \
     bot.py \
     requirements.txt \
-    .env \
+    "$ENV_FILE" \
     "$SERVER":~/meme-wrangler/
 
 echo "✓ Files uploaded"

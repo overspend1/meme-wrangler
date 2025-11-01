@@ -10,10 +10,10 @@ The easiest way to run the bot is using Docker:
 
 1. **Set up environment variables:**
    ```bash
-   cp .env.example .env
-   nano .env  # Edit with your bot credentials
+   cp .ENV.example .ENV
+   nano .ENV  # Edit with your bot credentials
    ```
-   The compose stack expects PostgreSQL credentials, so populate `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` (defaults provided). Backups are protected by a built-in SHA-256 hash; optionally define `MEMEBOT_BACKUP_PASSWORD_HASH` to replace it.
+   The compose file now looks for `.ENV` by default so Portainer and other orchestrators can supply secrets without additional flags. Copy `.ENV.example` to `.ENV`, then populate `TELEGRAM_BOT_TOKEN`, `OWNER_ID`, `CHANNEL_ID`, and the Postgres settings. You can still point the stack at a different file by exporting `COMPOSE_ENV_FILE` (e.g. `COMPOSE_ENV_FILE=staging.env docker compose up -d`). Backups are protected by a built-in SHA-256 hash; optionally define `MEMEBOT_BACKUP_PASSWORD_HASH` to replace it.
 
 2. **Run with Docker Compose:**
    ```bash
@@ -24,6 +24,8 @@ The easiest way to run the bot is using Docker:
    ```bash
    docker-compose logs -f
    ```
+
+   Deploying via Portainer? Upload your `.ENV` file under **Environment variables**—Portainer stores it beside the stack so the compose file picks it up automatically. Override `COMPOSE_ENV_FILE` only when you use a differently named file.
 
 4. **Stop the bot:**
    ```bash

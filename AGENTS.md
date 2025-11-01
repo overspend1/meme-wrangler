@@ -29,6 +29,6 @@
 - Link issues or TODOs, flag breaking changes in bold, and include screenshots only when UI-facing Telegram copy changes.
 
 ## Deployment & Secret Tips
-- Keep `.env` out of version control; copy from `.env.example` and set `TELEGRAM_BOT_TOKEN`, `OWNER_ID`, `CHANNEL_ID`, `POSTGRES_*` credentials, and `DATABASE_URL` for local runs.
+- Keep `.ENV` (or `.env`) out of version control; copy from `.ENV.example` and set `TELEGRAM_BOT_TOKEN`, `OWNER_ID`, `CHANNEL_ID`, `POSTGRES_*` credentials, and `DATABASE_URL` for local runs.
 - Only override `MEMEBOT_BACKUP_PASSWORD_HASH` if you plan to replace the baked-in SHA-256 hash for backup commands.
 - Docker workflows mount backups in `./backups/` and keep the PostgreSQL cluster in the `pgdata` volume; prune carefully when resetting schedules. New memes automatically generate a fresh backup file in that directory.
