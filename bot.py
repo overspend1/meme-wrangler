@@ -10,7 +10,7 @@ import io
 import json
 import logging
 import os
-from urllib.parse import urlparse, urlunparse, quote
+from urllib.parse import urlparse, urlunparse
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -112,12 +112,47 @@ def _build_database_url() -> Optional[str]:
 
 def _normalize_database_url(url: str) -> str:
     """Replace localhost hosts with the configured Postgres host for container runs."""
-    return url
+
+    host_override = os.environ.get("POSTGRES_HOST")
+    if not host_override:
+        return url
+
+    host_override = host_override.strip()
+    if not host_override or host_override in {"localhost", "127.0.0.1", "::1"}:
+        return url
+
+    parsed = urlparse(url)
+    if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        return url
+
+    if "@" in parsed.netloc:
+        auth_prefix, _, _ = parsed.netloc.rpartition("@")
+        auth_segment = f"{auth_prefix}@"
+    else:
+        auth_segment = ""
+
+    if parsed.port is not None:
+        port_fragment = f":{parsed.port}"
+    else:
+        port_env = os.environ.get("POSTGRES_PORT")
+        port_fragment = f":{port_env}" if port_env else ""
+
+    target_host = host_override
+    if ":" in target_host and not target_host.startswith("["):
+        target_host = f"[{target_host}]"
+
+    new_netloc = f"{auth_segment}{target_host}{port_fragment}"
+    rebuilt = parsed._replace(netloc=new_netloc)
+    return urlunparse(rebuilt)
 
 
 DATABASE_URL = _build_database_url()
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
+
+# Support multiple owner IDs (comma-separated)
+_owner_ids_raw = os.environ.get("OWNER_ID", "0")
+OWNER_IDS = set(int(oid.strip()) for oid in _owner_ids_raw.split(",") if oid.strip())
+
 CHANNEL_ID = os.environ.get("CHANNEL_ID")  # @channelusername or -100<id>
 BACKUP_DIR = Path(os.environ.get("MEMEBOT_BACKUP_DIR", "backups"))
 _HARDCODED_BACKUP_PASSWORD_HASH = "16c5b5ddf1b27f16ad5f801bb83595d00e666cc53085e53a4b1e67b715016251"
@@ -280,7 +315,7 @@ async def pop_due_memes_and_post(context: ContextTypes.DEFAULT_TYPE):
                 posting_log.pop(0)
 async def scheduled(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id != OWNER_ID:
+    if user_id not in OWNER_IDS:
         await update.message.reply_text("Only the owner can use this command.")
         return
 
@@ -366,7 +401,7 @@ async def scheduled(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(caption)
 async def unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id != OWNER_ID:
+    if user_id not in OWNER_IDS:
         await update.message.reply_text("Only the owner can use this command.")
         return
     if not context.args or not all(arg.isdigit() for arg in context.args):
@@ -385,7 +420,7 @@ async def unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Preview a scheduled meme by id. Tries direct send, then downloads and reuploads as a document if needed."""
     user_id = update.effective_user.id
-    if user_id != OWNER_ID:
+    if user_id not in OWNER_IDS:
         await update.message.reply_text("Only the owner can use this command.")
         return
     if not context.args or not context.args[0].isdigit():
@@ -446,7 +481,7 @@ async def preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def logcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id != OWNER_ID:
+    if user_id not in OWNER_IDS:
         await update.message.reply_text("Only the owner can use this command.")
         return
     if not posting_log:
@@ -457,7 +492,7 @@ async def logcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id != OWNER_ID:
+    if user_id not in OWNER_IDS:
         await update.message.reply_text("Only the owner can use this command.")
         return
     if not _verify_backup_password(context.args):
@@ -526,7 +561,7 @@ async def create_backup(send_document_to: Optional[int] = None, bot: Optional[An
 
 async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id != OWNER_ID:
+    if user_id not in OWNER_IDS:
         await update.message.reply_text("Only the owner can use this command.")
         return
     if not _verify_backup_password(context.args):
@@ -653,7 +688,7 @@ async def helpcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     <i>Example:</i> <code>/scheduleat ids: 5-10 2025-10-19</code>
 
 <b>Notes:</b>
-• <b>Only the owner</b> (set by OWNER_ID) can use admin commands.
+• <b>Only owners</b> (set by OWNER_ID) can use admin commands.
 • All times are in <b>IST (Asia/Kolkata)</b>.
 • Meme IDs are shown in <b>/scheduled</b> previews.
 • Use <b>/preview</b> to check a meme before posting.
@@ -666,7 +701,7 @@ async def helpcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg: Message = update.message
     user_id = msg.from_user.id
-    if user_id != OWNER_ID:
+    if user_id not in OWNER_IDS:
         await msg.reply_text("Sorry, only the owner can send memes to schedule.")
         return
 
@@ -707,7 +742,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def postnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id != OWNER_ID:
+    if user_id not in OWNER_IDS:
         await update.message.reply_text("Only the owner can use this command.")
         return
 
@@ -751,7 +786,7 @@ import re
 
 async def scheduleat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id != OWNER_ID:
+    if user_id not in OWNER_IDS:
         await update.message.reply_text("Only the owner can use this command.")
         return
     if not context.args or len(context.args) < 2:
