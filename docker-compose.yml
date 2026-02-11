@@ -5,6 +5,7 @@ services:
     image: postgres:15
     container_name: meme-wrangler-db
     restart: unless-stopped
+    profiles: ["", "local"]  # excluded in the "neon" profile
     env_file:
       - *compose_env_file
     environment:
@@ -27,6 +28,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+        required: false  # allow running without local PG when using Neon
     env_file:
       - *compose_env_file
     environment:
@@ -40,6 +42,9 @@ services:
       - POSTGRES_PORT=${POSTGRES_PORT:-5432}
       - DATABASE_URL=${DATABASE_URL:-postgresql://${POSTGRES_USER:-meme}:${POSTGRES_PASSWORD:-meme}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-meme_wrangler}}
       - MEMEBOT_BACKUP_DIR=${MEMEBOT_BACKUP_DIR:-/app/backups}
+      - MEMEBOT_BACKUP_INTERVAL_HOURS=${MEMEBOT_BACKUP_INTERVAL_HOURS:-6}
+      - MEMEBOT_BACKUP_RETAIN_COUNT=${MEMEBOT_BACKUP_RETAIN_COUNT:-10}
+      - MEMEBOT_BACKUP_STORE_IN_DB=${MEMEBOT_BACKUP_STORE_IN_DB:-true}
     volumes:
       - ./backups:/app/backups
     logging:
