@@ -9,6 +9,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from uuid import uuid4
 
 from meme_wrangler.config import cfg, IST
 from meme_wrangler.db import get_pool
@@ -69,8 +70,8 @@ async def create_backup(
     digest = _checksum(compressed)
 
     backup_root = _backup_dir()
-    timestamp = datetime.now(IST).strftime("%Y%m%d-%H%M%S")
-    filename = f"memes-backup-{timestamp}.json.gz"
+    timestamp = datetime.now(IST).strftime("%Y%m%d-%H%M%S-%f")
+    filename = f"memes-backup-{timestamp}-{uuid4().hex[:8]}.json.gz"
     backup_path = backup_root / filename
 
     backup_path.write_bytes(compressed)
