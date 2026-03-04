@@ -1,15 +1,18 @@
 """Tests for backup utilities (no DB required)."""
 
+import asyncio
 import gzip
 import json
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from meme_wrangler.backup import (
     _checksum,
+    create_backup,
     load_backup_data,
     rotate_backups,
     verify_latest_backup,
@@ -146,3 +149,40 @@ def test_verify_tampered():
             ok, msg = verify_latest_backup()
         assert not ok
         assert "FAILED" in msg
+
+
+def test_create_backup_generates_distinct_filenames_for_quick_runs():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+
+        class _AcquireCtx:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def fetch(self, _query):
+                return []
+
+        class _FakePool:
+            def acquire(self):
+                return _AcquireCtx()
+
+        with patch("meme_wrangler.backup.get_pool", new=AsyncMock(return_value=_FakePool())):
+            with patch("meme_wrangler.backup._backup_dir", return_value=tmp):
+                with patch("meme_wrangler.backup.rotate_backups", return_value=0):
+                    with patch("meme_wrangler.backup.cfg") as mock_cfg:
+                        mock_cfg.backup_store_in_db = False
+                        first_path, *_ = asyncio.run(create_backup())
+                        second_path, *_ = asyncio.run(create_backup())
+
+        assert first_path.exists()
+        assert second_path.exists()
+        assert first_path != second_path
+        assert first_path.name.startswith("memes-backup-")
+        assert second_path.name.startswith("memes-backup-")
+        assert first_path.suffixes == [".json", ".gz"]
+        assert second_path.suffixes == [".json", ".gz"]
+        assert first_path.with_suffix(first_path.suffix + ".sha256").exists()
+        assert second_path.with_suffix(second_path.suffix + ".sha256").exists()
