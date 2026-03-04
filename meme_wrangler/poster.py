@@ -57,6 +57,8 @@ async def pop_due_memes_and_post(bot) -> None:
                     f"{datetime.now(IST).isoformat(sep=' ')}: "
                     "all send methods failed"
                 )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             logger.exception("Failed to post meme id=%s: %s", meme.id, exc)
             _append_log(
@@ -71,6 +73,8 @@ async def periodic_poster(bot) -> None:
     while True:
         try:
             await pop_due_memes_and_post(bot)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception("Error in poster loop")
         await asyncio.sleep(30)
@@ -102,6 +106,8 @@ async def periodic_backup() -> None:
                 total,
                 sched,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception("Periodic backup failed")
 
@@ -119,5 +125,7 @@ async def periodic_health_check() -> None:
             ok = await check_pool_health()
             if not ok:
                 logger.warning("DB health check triggered pool recreation")
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception("Health check error")
