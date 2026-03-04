@@ -18,6 +18,9 @@ except ModuleNotFoundError:
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_BACKUP_INTERVAL_HOURS = 6.0
+DEFAULT_BACKUP_RETAIN_COUNT = 10
+
 # ---------------------------------------------------------------------------
 # Timezone helpers
 # ---------------------------------------------------------------------------
@@ -156,11 +159,14 @@ class Config:
         self.backup_password_hash: str = (
             os.environ.get("MEMEBOT_BACKUP_PASSWORD_HASH") or _hardcoded_hash
         )
-        self.backup_interval_hours: float = float(
-            os.environ.get("MEMEBOT_BACKUP_INTERVAL_HOURS", "6")
+        self._parse_errors: list[tuple[str, str]] = []
+        self.backup_interval_hours = self._parse_float_env(
+            "MEMEBOT_BACKUP_INTERVAL_HOURS",
+            DEFAULT_BACKUP_INTERVAL_HOURS,
         )
-        self.backup_retain_count: int = int(
-            os.environ.get("MEMEBOT_BACKUP_RETAIN_COUNT", "10")
+        self.backup_retain_count = self._parse_int_env(
+            "MEMEBOT_BACKUP_RETAIN_COUNT",
+            DEFAULT_BACKUP_RETAIN_COUNT,
         )
         self.backup_store_in_db: bool = (
             os.environ.get("MEMEBOT_BACKUP_STORE_IN_DB", "true").lower()
@@ -176,9 +182,37 @@ class Config:
         if self.is_neon:
             logger.info("Neon database detected - SSL and retry logic enabled")
 
+    def _parse_float_env(self, key: str, default: float) -> float:
+        raw_value = os.environ.get(key)
+        if raw_value is None:
+            return default
+        try:
+            return float(raw_value)
+        except ValueError:
+            self._parse_errors.append((key, raw_value))
+            return default
+
+    def _parse_int_env(self, key: str, default: int) -> int:
+        raw_value = os.environ.get(key)
+        if raw_value is None:
+            return default
+        try:
+            return int(raw_value)
+        except ValueError:
+            self._parse_errors.append((key, raw_value))
+            return default
+
     # ------------------------------------------------------------------
     def validate(self) -> None:
         """Raise *SystemExit* when mandatory settings are missing."""
+        if self._parse_errors:
+            errors = ", ".join(
+                f"{name}='{value}'" for name, value in self._parse_errors
+            )
+            raise SystemExit(
+                "Invalid numeric environment variable value(s): "
+                f"{errors}"
+            )
         if not self.bot_token:
             raise SystemExit(
                 "Please set TELEGRAM_BOT_TOKEN environment variable"
