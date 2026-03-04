@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -11,6 +12,9 @@ from meme_wrangler.db import get_pool
 from meme_wrangler.models import Meme
 
 logger = logging.getLogger(__name__)
+
+
+SCHEDULE_MEME_LOCK_KEY = 984331
 
 
 async def compute_next_slot(
@@ -54,6 +58,18 @@ async def schedule_meme(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            lock_start = time.monotonic()
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock($1)",
+                SCHEDULE_MEME_LOCK_KEY,
+            )
+            lock_wait_ms = (time.monotonic() - lock_start) * 1000
+            logger.info(
+                "Acquired schedule lock key=%s wait_ms=%.2f",
+                SCHEDULE_MEME_LOCK_KEY,
+                lock_wait_ms,
+            )
+
             last_ts = await get_last_scheduled_ts(conn)
             if last_ts is None:
                 ref_dt = datetime.now(IST)
