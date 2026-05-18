@@ -1,6 +1,11 @@
 .venv
+venv/
 __pycache__/
 *.pyc
 memes.db
 .env
 .ENV
+backups/
+runtime/
+cache/
+logs/

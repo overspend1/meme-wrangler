@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-posting_log = []  # in-memory log
-
-
 import asyncio
 import hashlib
 import hmac
@@ -10,74 +7,96 @@ import io
 import json
 import logging
 import os
-from urllib.parse import urlparse, urlunparse
+import re
+import secrets
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Optional
 from zoneinfo import ZoneInfo
-
-try:
-    import asyncpg  # type: ignore
-except ModuleNotFoundError:
-    asyncpg = None  # type: ignore
 
 try:
     import pytz
 except ModuleNotFoundError:
     pytz = None  # type: ignore
 
+from meme_wrangler.runtime import (
+    DatabaseRuntime,
+    format_bytes,
+    format_public_meme_id,
+    load_db_profiles,
+    parse_public_meme_id,
+    predict_fill_date,
+)
+
+posting_log: list[str] = []
+
 if TYPE_CHECKING:
-    from telegram import Update, Message, InputFile
-    from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, Update
+    from telegram.ext import (
+        ApplicationBuilder,
+        CallbackQueryHandler,
+        CommandHandler,
+        ContextTypes,
+        MessageHandler,
+        filters,
+    )
 else:
     try:
-        from telegram import Update, Message, InputFile  # type: ignore
+        from telegram import (  # type: ignore
+            InlineKeyboardButton,
+            InlineKeyboardMarkup,
+            InputFile,
+            Message,
+            Update,
+        )
         from telegram.ext import (  # type: ignore
             ApplicationBuilder,
-            ContextTypes,
+            CallbackQueryHandler,
             CommandHandler,
+            ContextTypes,
             MessageHandler,
             filters,
         )
     except ModuleNotFoundError:
-        Update = Message = InputFile = Any  # type: ignore
+        Update = Message = InputFile = InlineKeyboardButton = InlineKeyboardMarkup = Any  # type: ignore
         ContextTypes = SimpleNamespace(DEFAULT_TYPE=Any)  # type: ignore
 
         class _MissingTelegramModule:
-            """Lazily raise when Telegram features are used without dependency."""
-
             def __getattr__(self, item):
                 raise RuntimeError(
-                    "python-telegram-bot must be installed to use the Meme Wrangler bot (missing telegram module)."
+                    "python-telegram-bot must be installed to use the Meme Wrangler bot."
                 )
 
             def __call__(self, *args, **kwargs):
                 raise RuntimeError(
-                    "python-telegram-bot must be installed to use the Meme Wrangler bot (missing telegram module)."
+                    "python-telegram-bot must be installed to use the Meme Wrangler bot."
                 )
 
-        ApplicationBuilder = CommandHandler = MessageHandler = _MissingTelegramModule()  # type: ignore
+        ApplicationBuilder = CallbackQueryHandler = CommandHandler = MessageHandler = (  # type: ignore
+            _MissingTelegramModule()
+        )
 
         class _MissingFilters(SimpleNamespace):
             def __getattr__(self, item):
                 raise RuntimeError(
-                    "python-telegram-bot must be installed to use the Meme Wrangler bot (missing telegram filters)."
+                    "python-telegram-bot must be installed to use the Meme Wrangler bot."
                 )
 
         filters = _MissingFilters()  # type: ignore
 
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# IST timezone helpers
 if pytz is not None:
-    IST = pytz.timezone('Asia/Kolkata')
+    IST = pytz.timezone("Asia/Kolkata")
 
     def _ist_localize(dt: datetime) -> datetime:
         return IST.localize(dt)
+
 else:
-    IST = ZoneInfo('Asia/Kolkata')
+    IST = ZoneInfo("Asia/Kolkata")
 
     def _ist_localize(dt: datetime) -> datetime:
         if dt.tzinfo is None:
@@ -90,812 +109,998 @@ def _ensure_ist(dt: datetime) -> datetime:
         return _ist_localize(dt)
     return dt.astimezone(IST)
 
-def _build_database_url() -> Optional[str]:
-    """Derive the database URL from explicit env vars or component pieces."""
 
-    raw_url = os.environ.get("DATABASE_URL") or os.environ.get("MEMEBOT_DB")
-    if not raw_url:
-        user = os.environ.get("POSTGRES_USER")
-        password = os.environ.get("POSTGRES_PASSWORD")
-        db_name = os.environ.get("POSTGRES_DB")
-        host = os.environ.get("POSTGRES_HOST", "localhost")
-        port = os.environ.get("POSTGRES_PORT", "5432")
-        if user and password and db_name:
-            raw_url = (
-                f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}"
-                f"@{host}:{port}/{db_name}"
-            )
-    if raw_url:
-        return _normalize_database_url(raw_url)
-    return None
-
-
-def _normalize_database_url(url: str) -> str:
-    """Replace localhost hosts with the configured Postgres host for container runs."""
-
-    host_override = os.environ.get("POSTGRES_HOST")
-    if not host_override:
-        return url
-
-    host_override = host_override.strip()
-    if not host_override or host_override in {"localhost", "127.0.0.1", "::1"}:
-        return url
-
-    parsed = urlparse(url)
-    if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
-        return url
-
-    if "@" in parsed.netloc:
-        auth_prefix, _, _ = parsed.netloc.rpartition("@")
-        auth_segment = f"{auth_prefix}@"
-    else:
-        auth_segment = ""
-
-    if parsed.port is not None:
-        port_fragment = f":{parsed.port}"
-    else:
-        port_env = os.environ.get("POSTGRES_PORT")
-        port_fragment = f":{port_env}" if port_env else ""
-
-    target_host = host_override
-    if ":" in target_host and not target_host.startswith("["):
-        target_host = f"[{target_host}]"
-
-    new_netloc = f"{auth_segment}{target_host}{port_fragment}"
-    rebuilt = parsed._replace(netloc=new_netloc)
-    return urlunparse(rebuilt)
-
-
-DATABASE_URL = _build_database_url()
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-
-# Support multiple owner IDs (comma-separated)
-_owner_ids_raw = os.environ.get("OWNER_ID", "0")
-try:
-    OWNER_IDS = set(int(oid.strip()) for oid in _owner_ids_raw.split(",") if oid.strip())
-    logger.info(f"Configured owner IDs: {OWNER_IDS}")
-except ValueError as e:
-    logger.error(f"Failed to parse OWNER_ID env var '{_owner_ids_raw}': {e}")
-    OWNER_IDS = {0}
-
-CHANNEL_ID = os.environ.get("CHANNEL_ID")  # @channelusername or -100<id>
+CHANNEL_ID = os.environ.get("CHANNEL_ID")
+ADMIN_CHANNEL_ID = os.environ.get("MEMEBOT_ADMIN_CHANNEL_ID")
 BACKUP_DIR = Path(os.environ.get("MEMEBOT_BACKUP_DIR", "backups"))
-_HARDCODED_BACKUP_PASSWORD_HASH = "16c5b5ddf1b27f16ad5f801bb83595d00e666cc53085e53a4b1e67b715016251"
+RUNTIME_DIR = Path(os.environ.get("MEMEBOT_RUNTIME_DIR", "runtime"))
+CACHE_DIR = Path(os.environ.get("MEMEBOT_CACHE_DIR", "cache"))
+LOG_DIR = Path(os.environ.get("MEMEBOT_LOG_DIR", "logs"))
+ADMIN_EVENT_LOG = RUNTIME_DIR / "admin-events.jsonl"
+ALERT_STATE_PATH = RUNTIME_DIR / "storage-alert-state.json"
+PAGE_SIZE = 5
+PENDING_ACTION_TTL = timedelta(minutes=10)
+STORAGE_ALERT_CHECK_INTERVAL = timedelta(hours=6)
+
+_HARDCODED_BACKUP_PASSWORD_HASH = (
+    "16c5b5ddf1b27f16ad5f801bb83595d00e666cc53085e53a4b1e67b715016251"
+)
 _HASH_OVERRIDE = os.environ.get("MEMEBOT_BACKUP_PASSWORD_HASH")
 BACKUP_PASSWORD_HASH = _HASH_OVERRIDE if _HASH_OVERRIDE else _HARDCODED_BACKUP_PASSWORD_HASH
 
-DB_POOL: Optional[asyncpg.pool.Pool] = None
-_DB_INITIALIZED = False
+_owner_ids_raw = os.environ.get("OWNER_ID", "0")
+try:
+    OWNER_IDS = {int(oid.strip()) for oid in _owner_ids_raw.split(",") if oid.strip()}
+except ValueError as exc:
+    logger.error("Failed to parse OWNER_ID '%s': %s", _owner_ids_raw, exc)
+    OWNER_IDS = {0}
 
 SLOTS = [time(11, 0), time(16, 0), time(21, 0)]
+PENDING_ACTIONS: dict[str, dict[str, Any]] = {}
+LAST_STORAGE_ALERT_CHECK: Optional[datetime] = None
+_DB_RUNTIME: Optional[DatabaseRuntime] = None
 
-async def init_db() -> asyncpg.pool.Pool:
-    """Ensure the PostgreSQL pool and schema are ready."""
-    if asyncpg is None:
-        raise RuntimeError("asyncpg must be installed to use the database features.")
-    global DB_POOL, _DB_INITIALIZED
-    if DB_POOL is None:
-        if not DATABASE_URL:
-            raise RuntimeError("DATABASE_URL (or MEMEBOT_DB) must point to a PostgreSQL database")
-        DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    if not _DB_INITIALIZED:
-        async with DB_POOL.acquire() as conn:
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS memes (
-                    id SERIAL PRIMARY KEY,
-                    owner_file_id TEXT NOT NULL,
-                    mime_type TEXT,
-                    scheduled_ts BIGINT NOT NULL,
-                    posted INTEGER DEFAULT 0,
-                    created_ts BIGINT NOT NULL,
-                    preview_file_id TEXT,
-                    caption TEXT
-                )
-                """
-            )
-        _DB_INITIALIZED = True
-    return DB_POOL
+
+def get_db_runtime() -> DatabaseRuntime:
+    global _DB_RUNTIME
+    if _DB_RUNTIME is None:
+        profiles, active_key = load_db_profiles()
+        _DB_RUNTIME = DatabaseRuntime(
+            profiles=profiles,
+            active_key=active_key,
+            backup_dir=BACKUP_DIR,
+            runtime_dir=RUNTIME_DIR,
+            cache_dir=CACHE_DIR,
+            log_dir=LOG_DIR,
+        )
+    return _DB_RUNTIME
+
+
+async def init_db() -> DatabaseRuntime:
+    runtime = get_db_runtime()
+    await runtime.init_active_backend()
+    return runtime
 
 
 def _verify_backup_password(args: Optional[list[str]]) -> bool:
     if not args:
         return False
-    candidate = args[0]
-    candidate_hash = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+    candidate_hash = hashlib.sha256(args[0].encode("utf-8")).hexdigest()
     return hmac.compare_digest(candidate_hash, BACKUP_PASSWORD_HASH)
 
+
+def is_owner(user_id: Optional[int]) -> bool:
+    return user_id is not None and user_id in OWNER_IDS
+
+
+def now_ist() -> datetime:
+    return datetime.now(IST)
+
+
+def public_meme_id(value: int) -> str:
+    return format_public_meme_id(value)
+
+
+def parse_meme_ref(raw_value: str) -> Optional[int]:
+    return parse_public_meme_id(raw_value)
+
+
+def channel_label() -> str:
+    return CHANNEL_ID or "configured-channel"
+
+
+def status_badge(posted: int) -> str:
+    return "Posted" if posted else "Scheduled"
+
+
+def format_ts_ist(timestamp: int) -> str:
+    return datetime.fromtimestamp(timestamp, tz=IST).strftime("%Y-%m-%d %H:%M:%S IST")
+
+
+def cleanup_expired_actions() -> None:
+    now = now_ist()
+    expired = [
+        token
+        for token, payload in PENDING_ACTIONS.items()
+        if datetime.fromisoformat(payload["expires_at"]) <= now
+    ]
+    for token in expired:
+        payload = PENDING_ACTIONS.pop(token)
+        log_admin_event(payload["kind"], payload["user_id"], "cancelled", payload["summary"])
+
+
+def log_admin_event(action: str, user_id: int, outcome: str, detail: str) -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with ADMIN_EVENT_LOG.open("a", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "timestamp": now_ist().isoformat(),
+                    "action": action,
+                    "user_id": user_id,
+                    "outcome": outcome,
+                    "detail": detail,
+                }
+            )
+            + "\n"
+        )
+
+
+def load_admin_events() -> list[dict[str, Any]]:
+    if not ADMIN_EVENT_LOG.exists():
+        return []
+    events: list[dict[str, Any]] = []
+    for line in ADMIN_EVENT_LOG.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
+def require_owner(update: Update) -> bool:
+    return is_owner(getattr(update.effective_user, "id", None))
+
+
+async def reply_admin_only(update: Update) -> None:
+    if update.message:
+        await update.message.reply_text("❌ Admin only · Permission denied")
+
+
+def make_action_token() -> str:
+    return secrets.token_hex(8)
+
+
+def build_confirmation_markup(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Confirm", callback_data=f"action:confirm:{token}"),
+                InlineKeyboardButton("Cancel", callback_data=f"action:cancel:{token}"),
+            ]
+        ]
+    )
+
+
+def register_action(kind: str, user_id: int, summary: str, payload: dict[str, Any]) -> str:
+    cleanup_expired_actions()
+    token = make_action_token()
+    PENDING_ACTIONS[token] = {
+        "kind": kind,
+        "user_id": user_id,
+        "summary": summary,
+        "payload": payload,
+        "expires_at": (now_ist() + PENDING_ACTION_TTL).isoformat(),
+    }
+    return token
+
+
+def parse_id_arguments(args: list[str]) -> Optional[list[int]]:
+    resolved: list[int] = []
+    for raw_value in args:
+        meme_id = parse_meme_ref(raw_value)
+        if meme_id is None:
+            return None
+        resolved.append(meme_id)
+    return resolved
+
+
+async def notify_admin_channel(bot: Any, text: str) -> None:
+    if not ADMIN_CHANNEL_ID:
+        return
+    try:
+        await bot.send_message(ADMIN_CHANNEL_ID, text)
+    except Exception as exc:
+        logger.warning("Failed to notify admin channel: %s", exc)
+
+
 async def compute_next_slot(after_dt: Optional[datetime] = None) -> datetime:
-    """Return the next slot datetime from after_dt (exclusive). If after_dt is None, use now() in IST.
-    All calculations and returns are in IST timezone."""
     if after_dt is None:
-        # Get current time in IST
-        after_dt = datetime.now(IST)
+        after_dt = now_ist()
     else:
         after_dt = _ensure_ist(after_dt)
-    
-    # check same-day slots in IST
     today = after_dt.date()
     for slot in SLOTS:
         candidate = _ist_localize(datetime.combine(today, slot))
         if candidate > after_dt:
             return candidate
-    # otherwise next day's first slot
     next_day = today + timedelta(days=1)
     return _ist_localize(datetime.combine(next_day, SLOTS[0]))
 
-async def get_last_scheduled_ts(conn: asyncpg.Connection) -> Optional[int]:
-    row = await conn.fetchrow(
-        "SELECT scheduled_ts FROM memes WHERE posted=0 ORDER BY scheduled_ts DESC LIMIT 1"
-    )
-    return row["scheduled_ts"] if row else None
 
-async def schedule_meme(owner_file_id: str, mime_type: str, caption: Optional[str] = None) -> datetime:
-    pool = await init_db()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            # Always schedule after the latest scheduled meme, even if it's far in the future
-            last_ts = await get_last_scheduled_ts(conn)
-            if last_ts is None:
-                # no pending memes, schedule relative to now in IST
-                ref_dt = datetime.now(IST)
-            else:
-                # Convert timestamp to IST-aware datetime
-                ref_dt = datetime.fromtimestamp(last_ts, tz=IST)
-            next_dt = await compute_next_slot(ref_dt)
-
-            # context is not available here, so preview is best-effort: use owner_file_id for now
-            preview_file_id = owner_file_id
-            created_ts = int(datetime.now(IST).timestamp())
-
-            await conn.execute(
-                """
-                INSERT INTO memes (owner_file_id, mime_type, scheduled_ts, created_ts, preview_file_id, caption)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                """,
-                owner_file_id,
-                mime_type,
-                int(next_dt.timestamp()),
-                created_ts,
-                preview_file_id,
-                caption,
+async def create_backup(
+    send_document_to: Optional[int] = None,
+    bot: Optional[Any] = None,
+) -> tuple[Path, int, int]:
+    runtime = await init_db()
+    path, payload = await runtime.write_backup_file()
+    counts = payload["counts"]
+    if send_document_to and bot:
+        with path.open("rb") as fh:
+            await bot.send_document(
+                send_document_to,
+                InputFile(fh, filename=path.name),
+                caption=(
+                    "✅ Backup completed\n"
+                    f"Source: {runtime.active_key}\n"
+                    f"Records: {counts['total']} total · {counts['scheduled']} scheduled"
+                ),
             )
-    return next_dt
+    return path, counts["total"], counts["scheduled"]
 
-async def pop_due_memes_and_post(context: ContextTypes.DEFAULT_TYPE):
-    now_ts = int(datetime.now(IST).timestamp())
-    pool = await init_db()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id, owner_file_id, mime_type, caption
-            FROM memes
-            WHERE posted=0 AND scheduled_ts<= $1
-            ORDER BY scheduled_ts ASC
-            """,
-            now_ts,
+
+async def schedule_meme(
+    owner_file_id: str,
+    mime_type: str,
+    caption: Optional[str] = None,
+) -> tuple[int, datetime]:
+    runtime = await init_db()
+    async with runtime.operation_lock:
+        backend = await runtime.get_backend()
+        last_ts = await backend.get_last_scheduled_ts()
+        reference_dt = now_ist() if last_ts is None else datetime.fromtimestamp(last_ts, tz=IST)
+        next_dt = await compute_next_slot(reference_dt)
+        meme_id = await backend.insert_meme(
+            owner_file_id=owner_file_id,
+            mime_type=mime_type,
+            scheduled_ts=int(next_dt.timestamp()),
+            created_ts=int(now_ist().timestamp()),
+            preview_file_id=owner_file_id,
+            caption=caption,
         )
-
-    for row in rows:
-        mid = row["id"]
-        file_id = row["owner_file_id"]
-        mime = row["mime_type"]
-        caption = row["caption"]
-        try:
-            sent = False
-            # Try video first when appropriate
-            if mime and mime.startswith("video"):
-                try:
-                    await context.bot.send_video(CHANNEL_ID, file_id, caption=caption)
-                    sent = True
-                except Exception as e_video:
-                    logger.warning("send_video failed for id=%s: %s", mid, e_video)
-            if not sent:
-                # try as photo/animation
-                try:
-                    await context.bot.send_photo(CHANNEL_ID, file_id, caption=caption)
-                    sent = True
-                except Exception as e_photo:
-                    logger.warning("send_photo failed for id=%s: %s", mid, e_photo)
-                    # fallback to sending as document
-                    try:
-                        await context.bot.send_document(CHANNEL_ID, file_id, caption=caption)
-                        sent = True
-                    except Exception as e_doc:
-                        logger.warning("send_document failed for id=%s: %s", mid, e_doc)
-                        # raise the last exception to be caught below
-                        raise e_doc
-
-            if sent:
-                async with pool.acquire() as conn:
-                    await conn.execute("UPDATE memes SET posted=1 WHERE id=$1", mid)
-                logger.info("Posted meme id=%s", mid)
-                posting_log.append(f"[SUCCESS] Posted meme id={mid} at {datetime.now(IST).isoformat(sep=' ')}")
-                if len(posting_log) > 100:
-                    posting_log.pop(0)
-        except Exception as e:
-            logger.exception("Failed to post meme id=%s: %s", mid, e)
-            posting_log.append(f"[FAIL] Meme id={mid} at {datetime.now(IST).isoformat(sep=' ')}: {type(e).__name__}: {e}")
-            if len(posting_log) > 100:
-                posting_log.pop(0)
-async def scheduled(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in OWNER_IDS:
-        await update.message.reply_text("Only the owner can use this command.")
-        return
-
-    pool = await init_db()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id, scheduled_ts, mime_type, preview_file_id, owner_file_id, caption
-            FROM memes
-            WHERE posted=0
-            ORDER BY scheduled_ts ASC
-            """
-        )
-
-    if not rows:
-        await update.message.reply_text("No scheduled memes.")
-        return
-
-    # For each scheduled item, try to send a preview robustly (direct send, then download+reupload)
-    for row in rows:
-        mid = row["id"]
-        ts = row["scheduled_ts"]
-        mtype = row["mime_type"]
-        preview_id = row["preview_file_id"]
-        owner_file_id = row["owner_file_id"]
-        user_caption = row["caption"]
-
-        file_id = preview_id if preview_id else owner_file_id
-
-        # Build caption with ID, time, type and user's caption if present
-        caption_parts = [f"ID: {mid}", f"Time: {datetime.fromtimestamp(ts, tz=IST).strftime('%Y-%m-%d %H:%M:%S IST')}", f"Type: {mtype}"]
-        if user_caption:
-            caption_parts.append(f"Caption: {user_caption}")
-        caption = ", ".join(caption_parts)
-
-        sent = False
-        # Try direct sends with fallbacks
-        try:
-            if mtype and mtype.startswith('video'):
-                try:
-                    if file_id:
-                        await context.bot.send_video(update.effective_chat.id, file_id, caption=caption)
-                        sent = True
-                except Exception as e:  # direct video failed
-                    logger.debug("scheduled: direct send_video failed for id=%s: %s", mid, e)
-
-            if not sent and file_id:
-                try:
-                    await context.bot.send_photo(update.effective_chat.id, file_id, caption=caption)
-                    sent = True
-                except Exception as e:
-                    logger.debug("scheduled: direct send_photo failed for id=%s: %s", mid, e)
-                    try:
-                        await context.bot.send_document(update.effective_chat.id, file_id, caption=caption)
-                        sent = True
-                    except Exception as e2:
-                        logger.debug("scheduled: direct send_document failed for id=%s: %s", mid, e2)
-
-            if not sent and file_id:
-                # Attempt download + reupload
-                try:
-                    file = await context.bot.get_file(file_id)
-                    bio = io.BytesIO()
-                    await file.download(out=bio)
-                    bio.seek(0)
-                    if mtype and mtype.startswith('video'):
-                        await context.bot.send_video(update.effective_chat.id, InputFile(bio, filename=f"meme_{mid}.mp4"), caption=caption)
-                    else:
-                        try:
-                            await context.bot.send_photo(update.effective_chat.id, InputFile(bio, filename=f"meme_{mid}.jpg"), caption=caption)
-                        except Exception:
-                            bio.seek(0)
-                            await context.bot.send_document(update.effective_chat.id, InputFile(bio, filename=f"meme_{mid}"), caption=caption)
-                    sent = True
-                except Exception as e:
-                    logger.debug("scheduled: download+reupload failed for id=%s: %s", mid, e)
-
-        except Exception as e:
-            logger.exception("Unexpected error while previewing scheduled id=%s: %s", mid, e)
-
-        if not sent:
-            # If all attempts fail, send a text placeholder
-            await update.message.reply_text(caption)
-async def unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in OWNER_IDS:
-        await update.message.reply_text("Only the owner can use this command.")
-        return
-    if not context.args or not all(arg.isdigit() for arg in context.args):
-        await update.message.reply_text("Usage: /unschedule <id1> <id2> ...")
-        return
-    meme_ids = [int(arg) for arg in context.args]
-    pool = await init_db()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM memes WHERE posted=0 AND id = ANY($1::int[])",
-            meme_ids,
-        )
-    await update.message.reply_text(f"Unscheduled memes with IDs: {', '.join(str(mid) for mid in meme_ids)} (if they existed and were not posted yet).")
+        await runtime.write_backup_file()
+    return meme_id, next_dt
 
 
-async def preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Preview a scheduled meme by id. Tries direct send, then downloads and reuploads as a document if needed."""
-    user_id = update.effective_user.id
-    if user_id not in OWNER_IDS:
-        await update.message.reply_text("Only the owner can use this command.")
-        return
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Usage: /preview <id>")
-        return
-    meme_id = int(context.args[0])
-    # immediate ack so owner knows the command was received
+def format_scheduled_page(records: list[Any], page: int) -> tuple[str, InlineKeyboardMarkup]:
+    page_count = max(1, (len(records) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, page_count - 1))
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
+    lines = ["Scheduled Memes", ""]
+    if not records:
+        lines.append("No scheduled memes.")
+    else:
+        for record in records[start:end]:
+            lines.append(
+                f"{public_meme_id(record.id)} · {channel_label()} · "
+                f"{format_ts_ist(record.scheduled_ts)} · {status_badge(record.posted)}"
+            )
+        lines.extend(["", f"Page {page + 1}/{page_count} · Total {len(records)}"])
+    markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Prev", callback_data=f"scheduled:page:{max(page - 1, 0)}"),
+                InlineKeyboardButton("Refresh", callback_data=f"scheduled:refresh:{page}"),
+                InlineKeyboardButton(
+                    "Next", callback_data=f"scheduled:page:{min(page + 1, page_count - 1)}"
+                ),
+            ]
+        ]
+    )
+    return "\n".join(lines), markup
+
+
+def load_alert_state() -> dict[str, Any]:
+    if not ALERT_STATE_PATH.exists():
+        return {}
     try:
-        await update.message.reply_text(f"Previewing meme {meme_id}...")
-    except Exception:
-        logger.debug("Could not send ack reply for preview %s", meme_id)
-    pool = await init_db()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT owner_file_id, mime_type FROM memes WHERE id=$1",
-            meme_id,
-        )
-    if not row:
-        await update.message.reply_text(f"No meme found with ID {meme_id}.")
+        return json.loads(ALERT_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_alert_state(payload: dict[str, Any]) -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    ALERT_STATE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+async def render_storage_report() -> tuple[str, Optional[str]]:
+    runtime = await init_db()
+    snapshot = await runtime.capture_storage_snapshot()
+    history = runtime.storage_history(days=30)
+
+    recent = history[-2:] if len(history) >= 2 else history
+    weekly = history[-7:] if len(history) >= 7 else history
+
+    daily_fill = predict_fill_date(
+        recent,
+        snapshot.total_bytes,
+        capacity_bytes=None,
+        free_bytes=snapshot.local_free_bytes,
+    )
+
+    daily_growth = 0
+    if len(recent) >= 2:
+        older, newer = recent[0], recent[-1]
+        seconds = (
+            datetime.fromisoformat(newer.timestamp) - datetime.fromisoformat(older.timestamp)
+        ).total_seconds()
+        if seconds > 0:
+            daily_growth = int((newer.total_bytes - older.total_bytes) * 86400 / seconds)
+
+    weekly_growth = 0
+    if len(weekly) >= 2:
+        older, newer = weekly[0], weekly[-1]
+        seconds = (
+            datetime.fromisoformat(newer.timestamp) - datetime.fromisoformat(older.timestamp)
+        ).total_seconds()
+        if seconds > 0:
+            weekly_growth = int((newer.total_bytes - older.total_bytes) * 604800 / seconds)
+
+    lines = [
+        "Storage Status",
+        f"Active DB: {runtime.active_key}",
+        f"Database: {format_bytes(snapshot.db_bytes)}",
+        f"Backups: {format_bytes(snapshot.backup_bytes)}",
+        f"Cache: {format_bytes(snapshot.cache_bytes)}",
+        f"Logs: {format_bytes(snapshot.log_bytes)}",
+        f"Runtime: {format_bytes(snapshot.runtime_bytes)}",
+        f"Total tracked: {format_bytes(snapshot.total_bytes)}",
+        f"Local free space: {format_bytes(snapshot.local_free_bytes)}",
+        f"Daily growth: {format_bytes(daily_growth)}",
+        f"Weekly growth: {format_bytes(weekly_growth)}",
+        f"Predicted local fill date: {daily_fill or 'insufficient history'}",
+        "Recommended action: prune old backups or migrate before runway tightens.",
+    ]
+    return "\n".join(lines), daily_fill
+
+
+def storage_alert_level(fill_date: Optional[str]) -> Optional[str]:
+    if not fill_date:
+        return None
+    days_left = (datetime.fromisoformat(fill_date).date() - now_ist().date()).days
+    if days_left <= 3:
+        return "critical"
+    if days_left <= 14:
+        return "warning"
+    return None
+
+
+async def maybe_send_storage_alert(bot: Any) -> None:
+    global LAST_STORAGE_ALERT_CHECK
+    now = now_ist()
+    if LAST_STORAGE_ALERT_CHECK and now - LAST_STORAGE_ALERT_CHECK < STORAGE_ALERT_CHECK_INTERVAL:
         return
-    file_id = row["owner_file_id"]
-    mime = row["mime_type"]
+    LAST_STORAGE_ALERT_CHECK = now
+    report, fill_date = await render_storage_report()
+    level = storage_alert_level(fill_date)
+    if not level:
+        return
+    state = load_alert_state()
+    if state.get("level") == level and state.get("fill_date") == fill_date:
+        return
+    prefix = "⚠️" if level == "warning" else "❌"
+    await notify_admin_channel(
+        bot,
+        f"{prefix} Storage alert · Predicted date: {fill_date}\n"
+        "Recommended action: prune backups or switch databases.\n\n"
+        f"{report}",
+    )
+    save_alert_state({"level": level, "fill_date": fill_date, "sent_at": now.isoformat()})
+
+
+async def preview_record(record: Any, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    # Try direct sends with fallbacks
+    caption = f"{public_meme_id(record.id)} · {status_badge(record.posted)}"
     try:
-        if mime and mime.startswith("video"):
-            await context.bot.send_video(chat_id, file_id, caption=f"Preview ID {meme_id}")
+        if record.mime_type and record.mime_type.startswith("video"):
+            await context.bot.send_video(chat_id, record.owner_file_id, caption=caption)
             return
         try:
-            await context.bot.send_photo(chat_id, file_id, caption=f"Preview ID {meme_id}")
+            await context.bot.send_photo(chat_id, record.owner_file_id, caption=caption)
             return
-        except Exception as e_photo:
-            logger.debug("Direct send_photo failed for preview id=%s: %s", meme_id, e_photo)
-            # try send_document quick fallback
-            try:
-                await context.bot.send_document(chat_id, file_id, caption=f"Preview ID {meme_id}")
-                return
-            except Exception as e_doc:
-                logger.debug("Direct send_document failed for preview id=%s: %s", meme_id, e_doc)
-        # If direct fails, download and reupload
-        file = await context.bot.get_file(file_id)
-        bio = io.BytesIO()
-        await file.download(out=bio)
-        bio.seek(0)
-        # pick send method based on mime
-        if mime and mime.startswith("video"):
-            await context.bot.send_video(chat_id, InputFile(bio, filename=f"meme_{meme_id}.mp4"), caption=f"Preview ID {meme_id}")
+        except Exception:
+            await context.bot.send_document(chat_id, record.owner_file_id, caption=caption)
+            return
+    except Exception:
+        file = await context.bot.get_file(record.owner_file_id)
+        buffer = io.BytesIO()
+        await file.download(out=buffer)
+        buffer.seek(0)
+        if record.mime_type and record.mime_type.startswith("video"):
+            await context.bot.send_video(
+                chat_id,
+                InputFile(buffer, filename=f"{public_meme_id(record.id)}.mp4"),
+                caption=caption,
+            )
         else:
-            # try as photo first, then document
             try:
-                await context.bot.send_photo(chat_id, InputFile(bio, filename=f"meme_{meme_id}.jpg"), caption=f"Preview ID {meme_id}")
+                await context.bot.send_photo(
+                    chat_id,
+                    InputFile(buffer, filename=f"{public_meme_id(record.id)}.jpg"),
+                    caption=caption,
+                )
             except Exception:
-                bio.seek(0)
-                await context.bot.send_document(chat_id, InputFile(bio, filename=f"meme_{meme_id}"), caption=f"Preview ID {meme_id}")
-    except Exception as e:
-        logger.exception("Preview failed for id=%s: %s", meme_id, e)
-        await update.message.reply_text(f"Failed to preview meme {meme_id}: {type(e).__name__}: {e}")
+                buffer.seek(0)
+                await context.bot.send_document(
+                    chat_id,
+                    InputFile(buffer, filename=public_meme_id(record.id)),
+                    caption=caption,
+                )
 
-async def logcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in OWNER_IDS:
-        await update.message.reply_text("Only the owner can use this command.")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "MemeBot is online.\n"
+        "Send a photo, video, or GIF in private chat to queue it for the next slot."
+    )
+
+
+async def helpcmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "MemeBot Commands\n"
+        "/scheduled · list queued memes\n"
+        "/preview MEME-0001 · preview a queued meme\n"
+        "/unschedule MEME-0001 · cancel queued memes with confirmation\n"
+        "/postnow [MEME-0001] · publish next queued meme or a specific one\n"
+        "/scheduleat id: MEME-0001 16:20 · move one meme\n"
+        "/backup <password> · export a verified backup\n"
+        "/restore <password> · reply to a backup file and confirm restore\n"
+        "/database · open migration and switch controls\n"
+        "/storage or /status · storage and runway report\n"
+        "/logs [action] [YYYY-MM-DD] · admin event log"
+    )
+
+
+async def scheduled(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not require_owner(update):
+        await reply_admin_only(update)
         return
-    if not posting_log:
-        await update.message.reply_text("No posting events yet.")
+    runtime = await init_db()
+    backend = await runtime.get_backend()
+    records = await backend.list_pending_memes()
+    text, markup = format_scheduled_page(records, 0)
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+async def unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not require_owner(update):
+        await reply_admin_only(update)
         return
-    await update.message.reply_text("Last posting events:\n" + "\n".join(posting_log[-10:]))
+    if not context.args:
+        await update.message.reply_text("❌ Usage · /unschedule MEME-0001 [MEME-0002 ...]")
+        return
+    meme_ids = parse_id_arguments(context.args)
+    if meme_ids is None:
+        await update.message.reply_text("❌ Invalid meme ID · Use MEME-XXXX or a numeric ID")
+        return
+    token = register_action(
+        "unschedule",
+        update.effective_user.id,
+        ", ".join(public_meme_id(meme_id) for meme_id in meme_ids),
+        {"meme_ids": meme_ids},
+    )
+    await update.message.reply_text(
+        "Confirm unschedule\n"
+        + "\n".join(f"• {public_meme_id(meme_id)}" for meme_id in meme_ids),
+        reply_markup=build_confirmation_markup(token),
+    )
 
 
-async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in OWNER_IDS:
-        await update.message.reply_text("Only the owner can use this command.")
+async def preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not require_owner(update):
+        await reply_admin_only(update)
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Usage · /preview MEME-0001")
+        return
+    meme_id = parse_meme_ref(context.args[0])
+    if meme_id is None:
+        await update.message.reply_text("❌ Invalid meme ID · Use MEME-XXXX or a numeric ID")
+        return
+    runtime = await init_db()
+    backend = await runtime.get_backend()
+    record = await backend.get_meme(meme_id)
+    if record is None:
+        await update.message.reply_text(
+            f"❌ Preview failed · {public_meme_id(meme_id)} not found · Suggested fix: /scheduled"
+        )
+        return
+    await preview_record(record, update, context)
+
+
+async def logcmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not require_owner(update):
+        await reply_admin_only(update)
+        return
+    action_filter = context.args[0] if context.args else None
+    date_filter = context.args[1] if len(context.args) > 1 else None
+    filtered = []
+    for event in load_admin_events():
+        if action_filter and event.get("action") != action_filter:
+            continue
+        if date_filter and not str(event.get("timestamp", "")).startswith(date_filter):
+            continue
+        filtered.append(event)
+    if not filtered:
+        await update.message.reply_text("No matching admin events.")
+        return
+    lines = ["Admin Events"]
+    for event in filtered[-10:]:
+        lines.append(
+            f"{event['timestamp']} · {event['action']} · user={event['user_id']} · "
+            f"{event['outcome']} · {event['detail']}"
+        )
+    await update.message.reply_text("\n".join(lines))
+
+
+async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not require_owner(update):
+        await reply_admin_only(update)
         return
     if not _verify_backup_password(context.args):
-        await update.message.reply_text("Backup password missing or incorrect. Usage: /backup <password>")
+        await update.message.reply_text("❌ Backup denied · Invalid password")
         return
-
     try:
-        backup_path, total_memes, scheduled_memes = await create_backup(
+        path, total_memes, scheduled_memes = await create_backup(
             send_document_to=update.effective_chat.id,
             bot=context.bot,
         )
-        logger.info("Backup exported to %s", backup_path)
+        log_admin_event(
+            "backup",
+            update.effective_user.id,
+            "success",
+            f"{path.name} · total={total_memes} · scheduled={scheduled_memes}",
+        )
+        await update.message.reply_text(
+            "✅ Action completed\n"
+            f"Source: {get_db_runtime().active_key}\n"
+            f"Records: {total_memes} total · {scheduled_memes} scheduled\n"
+            f"File: {path.name}"
+        )
     except Exception as exc:
-        logger.exception("Backup failed: %s", exc)
-        await update.message.reply_text(f"Backup failed: {type(exc).__name__}: {exc}")
-
-async def create_backup(send_document_to: Optional[int] = None, bot: Optional[Any] = None):
-    pool = await init_db()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id, owner_file_id, mime_type, scheduled_ts, posted, created_ts, preview_file_id, caption
-            FROM memes
-            ORDER BY id
-            """
+        log_admin_event("backup", update.effective_user.id, "failed", str(exc))
+        await update.message.reply_text(
+            f"❌ Backup failed · {type(exc).__name__}: {exc} · Suggested fix: verify DB access"
         )
 
-    memes = []
-    for row in rows:
-        meme = {
-            "id": int(row["id"]),
-            "owner_file_id": row["owner_file_id"],
-            "mime_type": row["mime_type"],
-            "scheduled_ts": int(row["scheduled_ts"]),
-            "posted": int(row["posted"]),
-            "created_ts": int(row["created_ts"]),
-            "preview_file_id": row["preview_file_id"],
-            "caption": row["caption"],
-        }
-        memes.append(meme)
 
-    scheduled_memes = [m for m in memes if m["posted"] == 0]
-    payload = {
-        "version": 1,
-        "generated_at": datetime.now(IST).isoformat(),
-        "memes": memes,
-        "scheduled_memes": scheduled_memes,
-    }
-
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(IST).strftime("%Y%m%d-%H%M%S")
-    filename = f"memes-backup-{timestamp}.json"
-    backup_path = BACKUP_DIR / filename
-    with backup_path.open("w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2)
-
-    if send_document_to and bot:
-        with backup_path.open("rb") as fh:
-            await bot.send_document(
-                send_document_to,
-                InputFile(fh, filename=filename),
-                caption=f"Backup created: {len(memes)} total memes ({len(scheduled_memes)} scheduled).",
-            )
-    return backup_path, len(memes), len(scheduled_memes)
-
-
-async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in OWNER_IDS:
-        await update.message.reply_text("Only the owner can use this command.")
+async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not require_owner(update):
+        await reply_admin_only(update)
         return
     if not _verify_backup_password(context.args):
-        await update.message.reply_text("Backup password missing or incorrect. Usage: /restore <password> (reply to backup file)")
+        await update.message.reply_text("❌ Restore denied · Invalid password")
         return
-
     replied = update.message.reply_to_message if update.message else None
     if not replied or not replied.document:
-        await update.message.reply_text("Reply to a backup JSON document with /restore.")
+        await update.message.reply_text("❌ Restore requires a replied backup JSON document")
         return
-
     file = await context.bot.get_file(replied.document.file_id)
     buffer = io.BytesIO()
     await file.download(out=buffer)
     buffer.seek(0)
     try:
-        data = json.loads(buffer.read().decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        await update.message.reply_text(f"Could not parse backup: {exc}")
+        payload = json.loads(buffer.read().decode("utf-8"))
+        get_db_runtime().verify_payload(payload)
+    except Exception as exc:
+        await update.message.reply_text(
+            f"❌ Restore validation failed · {type(exc).__name__}: {exc}"
+        )
         return
-
-    memes = data.get("memes")
-    if not isinstance(memes, list):
-        await update.message.reply_text("Backup file missing 'memes' list.")
-        return
-
-    records = []
-    try:
-        for item in memes:
-            records.append(
-                (
-                    int(item["id"]),
-                    item["owner_file_id"],
-                    item.get("mime_type"),
-                    int(item["scheduled_ts"]),
-                    int(item.get("posted", 0)),
-                    int(item["created_ts"]),
-                    item.get("preview_file_id"),
-                    item.get("caption"),
-                )
-            )
-    except (KeyError, TypeError, ValueError) as exc:
-        await update.message.reply_text(f"Backup format error: {exc}")
-        return
-
-    pool = await init_db()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute("TRUNCATE TABLE memes RESTART IDENTITY")
-            if records:
-                await conn.executemany(
-                    """
-                    INSERT INTO memes (id, owner_file_id, mime_type, scheduled_ts, posted, created_ts, preview_file_id, caption)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                    """,
-                    records,
-                )
-                max_id = max(record[0] for record in records)
-            else:
-                max_id = 0
-
-            seq_name = await conn.fetchval("SELECT pg_get_serial_sequence('memes', 'id')")
-            if seq_name:
-                if max_id > 0:
-                    await conn.execute("SELECT setval($1, $2, true)", seq_name, max_id)
-                else:
-                    await conn.execute("SELECT setval($1, 1, false)", seq_name)
-
-    scheduled_count = sum(1 for record in records if record[4] == 0)
-    await update.message.reply_text(
-        f"Restore complete: {len(records)} memes imported ({scheduled_count} scheduled)."
+    token = register_action(
+        "restore",
+        update.effective_user.id,
+        replied.document.file_name or "backup.json",
+        {"payload": payload, "filename": replied.document.file_name or "backup.json"},
     )
-    logger.info("Restored %s memes from backup", len(records))
+    await update.message.reply_text(
+        "Confirm restore\n"
+        f"Backup: {replied.document.file_name or 'backup.json'}\n"
+        f"Records: {payload['counts']['total']} total · {payload['counts']['scheduled']} scheduled",
+        reply_markup=build_confirmation_markup(token),
+    )
 
-async def periodic_poster(application):
+
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg: Message = update.message
+    if msg.from_user.id not in OWNER_IDS:
+        await msg.reply_text("❌ Admin only · Permission denied")
+        return
+    file_id = None
+    mime = None
+    caption = msg.caption
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+        mime = "image"
+    elif msg.video:
+        file_id = msg.video.file_id
+        mime = "video"
+    elif msg.animation:
+        file_id = msg.animation.file_id
+        mime = "image"
+    else:
+        await msg.reply_text("❌ Unsupported media · Send a photo, GIF, or video")
+        return
+    meme_id, scheduled_dt = await schedule_meme(file_id, mime, caption)
+    await msg.reply_text(
+        "✅ Action completed · "
+        f"ID: {public_meme_id(meme_id)} · Scheduled: {scheduled_dt.strftime('%Y-%m-%d %H:%M:%S IST')}"
+    )
+
+
+async def postnow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not require_owner(update):
+        await reply_admin_only(update)
+        return
+    runtime = await init_db()
+    backend = await runtime.get_backend()
+    meme_id: Optional[int] = None
+    if context.args:
+        meme_id = parse_meme_ref(context.args[0])
+        if meme_id is None:
+            await update.message.reply_text("❌ Invalid meme ID · Use MEME-XXXX or a numeric ID")
+            return
+    record = await backend.get_pending_meme(meme_id) if meme_id else await backend.get_next_pending_meme()
+    if record is None:
+        await update.message.reply_text("❌ No scheduled meme found")
+        return
+    try:
+        if record.mime_type and record.mime_type.startswith("video"):
+            await context.bot.send_video(CHANNEL_ID, record.owner_file_id, caption=record.caption)
+        else:
+            await context.bot.send_photo(CHANNEL_ID, record.owner_file_id, caption=record.caption)
+        async with runtime.operation_lock:
+            await backend.mark_posted(record.id)
+            await runtime.write_backup_file()
+        await update.message.reply_text(
+            f"✅ Action completed · ID: {public_meme_id(record.id)} · Posted to {channel_label()}"
+        )
+    except Exception as exc:
+        await update.message.reply_text(
+            f"❌ Post failed · {type(exc).__name__}: {exc} · Suggested fix: verify media access"
+        )
+
+
+async def scheduleat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not require_owner(update):
+        await reply_admin_only(update)
+        return
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "❌ Usage · /scheduleat id: MEME-0001 16:20 or /scheduleat ids: 5-10 2026-05-17"
+        )
+        return
+    argstr = " ".join(context.args)
+    m_single = re.match(r"id:\s*([A-Za-z0-9-]+)\s+(\d{2}):(\d{2})$", argstr)
+    m_range = re.match(r"ids:\s*(\d+)-(\d+)\s+(\d{4}-\d{2}-\d{2})$", argstr)
+    runtime = await init_db()
+    backend = await runtime.get_backend()
+    if m_single:
+        meme_id = parse_meme_ref(m_single.group(1))
+        if meme_id is None:
+            await update.message.reply_text("❌ Invalid meme ID · Use MEME-XXXX")
+            return
+        hour = int(m_single.group(2))
+        minute = int(m_single.group(3))
+        if not (0 <= hour < 24 and 0 <= minute < 60):
+            await update.message.reply_text("❌ Invalid time · Use HH:MM in 24-hour format")
+            return
+        now_local = now_ist()
+        scheduled_dt = _ist_localize(
+            datetime(now_local.year, now_local.month, now_local.day, hour, minute)
+        )
+        async with runtime.operation_lock:
+            updated = await backend.update_schedule(meme_id, int(scheduled_dt.timestamp()))
+            if updated:
+                await runtime.write_backup_file()
+        if not updated:
+            await update.message.reply_text(
+                f"❌ Reschedule failed · {public_meme_id(meme_id)} not pending"
+            )
+            return
+        await update.message.reply_text(
+            "✅ Action completed · "
+            f"ID: {public_meme_id(meme_id)} · Scheduled: {scheduled_dt.strftime('%Y-%m-%d %H:%M:%S IST')}"
+        )
+        return
+    if m_range:
+        start_id = int(m_range.group(1))
+        end_id = int(m_range.group(2))
+        base_date = _ist_localize(datetime.strptime(m_range.group(3), "%Y-%m-%d"))
+        updates = []
+        for index, meme_id in enumerate(range(start_id, end_id + 1)):
+            slot = SLOTS[index % len(SLOTS)]
+            scheduled_dt = base_date.replace(
+                hour=slot.hour,
+                minute=slot.minute,
+                second=0,
+                microsecond=0,
+            )
+            updates.append((int(scheduled_dt.timestamp()), meme_id))
+        async with runtime.operation_lock:
+            updated_count = await backend.update_many_schedules(updates)
+            if updated_count:
+                await runtime.write_backup_file()
+        await update.message.reply_text(
+            "✅ Action completed · "
+            f"IDs: MEME-{start_id:04d}..MEME-{end_id:04d} · Updated: {updated_count}"
+        )
+        return
+    await update.message.reply_text("❌ Invalid format · Suggested fix: /help")
+
+
+async def pop_due_memes_and_post(context: ContextTypes.DEFAULT_TYPE) -> None:
+    runtime = await init_db()
+    backend = await runtime.get_backend()
+    records = await backend.list_due_memes(int(now_ist().timestamp()))
+    for record in records:
+        try:
+            sent = False
+            if record.mime_type and record.mime_type.startswith("video"):
+                try:
+                    await context.bot.send_video(CHANNEL_ID, record.owner_file_id, caption=record.caption)
+                    sent = True
+                except Exception as exc:
+                    logger.warning("send_video failed for %s: %s", public_meme_id(record.id), exc)
+            if not sent:
+                try:
+                    await context.bot.send_photo(CHANNEL_ID, record.owner_file_id, caption=record.caption)
+                    sent = True
+                except Exception:
+                    await context.bot.send_document(CHANNEL_ID, record.owner_file_id, caption=record.caption)
+                    sent = True
+            if sent:
+                async with runtime.operation_lock:
+                    await backend.mark_posted(record.id)
+                    await runtime.write_backup_file()
+                posting_log.append(
+                    f"[SUCCESS] {public_meme_id(record.id)} posted at {now_ist().isoformat(sep=' ')}"
+                )
+                posting_log[:] = posting_log[-100:]
+        except Exception as exc:
+            logger.exception("Failed to post %s: %s", public_meme_id(record.id), exc)
+            posting_log.append(
+                f"[FAIL] {public_meme_id(record.id)} at {now_ist().isoformat(sep=' ')}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            posting_log[:] = posting_log[-100:]
+
+
+async def database_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not require_owner(update):
+        await reply_admin_only(update)
+        return
+    runtime = await init_db()
+    buttons = []
+    for key, profile in runtime.profiles.items():
+        if key == runtime.active_key:
+            continue
+        buttons.append(
+            [
+                InlineKeyboardButton(f"Migrate → {profile.label}", callback_data=f"db:migrate:{key}"),
+                InlineKeyboardButton(f"Switch → {profile.label}", callback_data=f"db:switch:{key}"),
+            ]
+        )
+    if not buttons:
+        buttons = [[InlineKeyboardButton("Refresh", callback_data="db:refresh")]]
+    await update.message.reply_text(
+        "Database Control\n"
+        f"Active: {runtime.active_key}\n"
+        "Use the buttons below for verified migrations or emergency switches.",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def storage_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not require_owner(update):
+        await reply_admin_only(update)
+        return
+    report, _ = await render_storage_report()
+    await update.message.reply_text(report)
+
+
+async def execute_registered_action(
+    token: str,
+    query: Any,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    cleanup_expired_actions()
+    payload = PENDING_ACTIONS.pop(token, None)
+    if payload is None:
+        await query.edit_message_text("❌ Action expired · Suggested fix: run the command again")
+        return
+    if payload["user_id"] != query.from_user.id:
+        await query.answer("Action belongs to a different admin.", show_alert=True)
+        return
+
+    runtime = await init_db()
+    kind = payload["kind"]
+    details = payload["payload"]
+    try:
+        if kind == "unschedule":
+            backend = await runtime.get_backend()
+            async with runtime.operation_lock:
+                deleted = await backend.delete_pending(details["meme_ids"])
+                if deleted:
+                    await runtime.write_backup_file()
+            deleted_ids = ", ".join(public_meme_id(meme_id) for meme_id in deleted) or "none"
+            log_admin_event(kind, query.from_user.id, "success", deleted_ids)
+            await query.edit_message_text(
+                f"✅ Action completed · IDs: {deleted_ids} · Status: cancelled"
+            )
+            return
+
+        if kind == "restore":
+            async with runtime.operation_lock:
+                pre_restore_path, _ = await runtime.write_backup_file()
+                counts = await runtime.import_payload(details["payload"], runtime.active_key)
+                post_restore_path, _ = await runtime.write_backup_file()
+            log_admin_event(
+                kind,
+                query.from_user.id,
+                "success",
+                f"file={details['filename']} · pre={pre_restore_path.name} · post={post_restore_path.name}",
+            )
+            await query.edit_message_text(
+                "✅ Action completed · "
+                f"Restore source: {details['filename']} · Records: {counts['total']} total"
+            )
+            return
+
+        if kind in {"migrate", "switch"}:
+            summary = await runtime.migrate_to(
+                details["target_key"],
+                allow_backup_fallback=(kind == "switch"),
+            )
+            log_admin_event(kind, query.from_user.id, "success", json.dumps(summary))
+            await query.edit_message_text(
+                f"✅ Action completed · Active DB: {summary['target_key']} · "
+                f"Records: {summary['target_counts']['total']}"
+            )
+            await notify_admin_channel(
+                context.bot,
+                (
+                    f"Database {kind.title()} Summary\n"
+                    f"Source: {summary['source_key']}\n"
+                    f"Target: {summary['target_key']}\n"
+                    f"Records moved: {summary['target_counts']['total']}\n"
+                    f"Scheduled moved: {summary['target_counts']['scheduled']}\n"
+                    f"Backup: {Path(summary['backup_path']).name}\n"
+                    f"Source mode: {summary['source_mode']}\n"
+                    f"Fallback until: {summary['fallback_until']}\n"
+                    f"Warnings: {', '.join(summary['warnings']) or 'none'}"
+                ),
+            )
+            return
+
+        await query.edit_message_text("❌ Unsupported action")
+    except Exception as exc:
+        log_admin_event(kind, query.from_user.id, "failed", str(exc))
+        await query.edit_message_text(
+            f"❌ {kind} failed · {type(exc).__name__}: {exc} · Suggested fix: review /logs"
+        )
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if data.startswith("scheduled:"):
+        runtime = await init_db()
+        backend = await runtime.get_backend()
+        records = await backend.list_pending_memes()
+        _, _, raw_page = data.split(":")
+        text, markup = format_scheduled_page(records, int(raw_page))
+        await query.edit_message_text(text, reply_markup=markup)
+        return
+
+    if data.startswith("action:cancel:"):
+        token = data.split(":")[-1]
+        payload = PENDING_ACTIONS.pop(token, None)
+        if payload:
+            log_admin_event(payload["kind"], query.from_user.id, "cancelled", payload["summary"])
+        await query.edit_message_text("✅ Action cancelled")
+        return
+
+    if data.startswith("action:confirm:"):
+        await execute_registered_action(data.split(":")[-1], query, context)
+        return
+
+    if data == "db:refresh":
+        runtime = await init_db()
+        buttons = []
+        for key, profile in runtime.profiles.items():
+            if key == runtime.active_key:
+                continue
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"Migrate → {profile.label}",
+                        callback_data=f"db:migrate:{key}",
+                    ),
+                    InlineKeyboardButton(
+                        f"Switch → {profile.label}",
+                        callback_data=f"db:switch:{key}",
+                    ),
+                ]
+            )
+        await query.edit_message_text(
+            f"Database Control\nActive: {runtime.active_key}",
+            reply_markup=InlineKeyboardMarkup(
+                buttons or [[InlineKeyboardButton("Refresh", callback_data="db:refresh")]]
+            ),
+        )
+        return
+
+    if data.startswith("db:migrate:") or data.startswith("db:switch:"):
+        _, kind, target_key = data.split(":")
+        runtime = await init_db()
+        profile = runtime.profiles.get(target_key)
+        if profile is None:
+            await query.edit_message_text("❌ Unknown database profile")
+            return
+        token = register_action(
+            kind,
+            query.from_user.id,
+            f"{runtime.active_key} -> {target_key}",
+            {"target_key": target_key},
+        )
+        await query.edit_message_text(
+            f"Confirm {kind}\n"
+            f"Source: {runtime.active_key}\n"
+            f"Target: {profile.label}\n"
+            f"Mode: {'verified migration' if kind == 'migrate' else 'emergency switch with backup fallback'}",
+            reply_markup=build_confirmation_markup(token),
+        )
+
+
+async def periodic_poster(application: Any) -> None:
     while True:
         try:
             await pop_due_memes_and_post(application)
+            await maybe_send_storage_alert(application.bot)
         except Exception:
             logger.exception("Error in poster loop")
         await asyncio.sleep(30)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hi! I schedule memes to the configured channel.")
 
-async def helpcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a detailed help message with all commands."""
-    help_text = (
-        """
-<b>🤖 <u>Meme Wrangler Bot Command Reference</u> 🤖</b>
-
-<b>General:</b>
-  <b>/start</b> — Show a welcome message.
-  <b>/help</b> — Show this help message.
-
-<b>Scheduling Memes:</b>
-  <b>Send a photo/video/animation</b> (as a DM to the bot):
-    Schedules it for the next available slot (11:00, 16:00, 21:00 IST).
-    Add a caption to include it with the post.
-    <i>Example:</i> Send a meme to the bot in DM with or without caption.
-
-  <b>/scheduled</b> — List all scheduled memes with previews and their IDs, times, and types.
-
-  <b>/unschedule &lt;id1&gt; [&lt;id2&gt; ...]</b> — Remove one or more memes from the schedule (by ID).
-    <i>Example:</i> <code>/unschedule 3 5 7</code>
-
-  <b>/postnow [id]</b> — Immediately post the next scheduled meme, or a specific meme by ID.
-    <i>Example:</i> <code>/postnow</code> or <code>/postnow 6</code>
-
-  <b>/preview &lt;id&gt;</b> — Preview a scheduled meme by its ID.
-    <i>Example:</i> <code>/preview 4</code>
-
-  <b>/log</b> — Show the last 10 posting events (success/failure log).
-
-<b>Maintenance:</b>
-  <b>/backup &lt;password&gt;</b> — Export all memes (including scheduled ones) as a JSON backup.
-  <b>/restore &lt;password&gt;</b> — Reply to a backup JSON with this command to restore memes.
-
-<b>Advanced Scheduling:</b>
-  <b>/scheduleat id: &lt;id&gt; &lt;HH:MM&gt;</b> — Reschedule a single meme to a specific time (24h, IST).
-    <i>Example:</i> <code>/scheduleat id: 6 16:20</code>
-
-  <b>/scheduleat ids: &lt;start&gt;-&lt;end&gt; &lt;YYYY-MM-DD&gt;</b> — Reschedule a range of memes to a date, assigning slots (11:00, 16:00, 21:00 IST) in order.
-    <i>Example:</i> <code>/scheduleat ids: 5-10 2025-10-19</code>
-
-<b>Notes:</b>
-• <b>Only owners</b> (set by OWNER_ID) can use admin commands.
-• All times are in <b>IST (Asia/Kolkata)</b>.
-• Meme IDs are shown in <b>/scheduled</b> previews.
-• Use <b>/preview</b> to check a meme before posting.
-
-<b>✨ Enjoy effortless meme scheduling! ✨</b>
-        """
-    )
-    await update.message.reply_text(help_text, parse_mode="HTML", disable_web_page_preview=True)
-
-async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg: Message = update.message
-    user_id = msg.from_user.id
-    if user_id not in OWNER_IDS:
-        await msg.reply_text("Sorry, only the owner can send memes to schedule.")
-        return
-
-    # Determine the best file id and mime
-    file_id = None
-    mime = None
-    caption = msg.caption  # Get caption if present
-    
-    if msg.photo:
-        # highest resolution
-        file = msg.photo[-1]
-        file_id = file.file_id
-        mime = 'image'
-    elif msg.video:
-        file_id = msg.video.file_id
-        mime = 'video'
-    elif msg.animation:
-        file_id = msg.animation.file_id
-        mime = 'image'  # gifs treated as image
-    else:
-        await msg.reply_text("Please send a photo, animation (GIF) or video.")
-        return
-
-    scheduled_dt = await schedule_meme(file_id, mime, caption)
-    # scheduled_dt is already in IST timezone
-    await msg.reply_text(f"Scheduled for: {scheduled_dt.strftime('%Y-%m-%d %H:%M:%S IST')}")
-    # Automatic backup after each meme intake
-    try:
-        backup_path, total, scheduled_count = await create_backup()
-        logger.info(
-            "Automatic backup created at %s after scheduling meme. totals: %s (scheduled %s)",
-            backup_path,
-            total,
-            scheduled_count,
-        )
-    except Exception as exc:
-        logger.exception("Automatic backup failed after scheduling meme: %s", exc)
-
-async def postnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in OWNER_IDS:
-        await update.message.reply_text("Only the owner can use this command.")
-        return
-
-    # If an ID is provided, post that meme; else, post the next scheduled meme
-    meme_id = None
-    if context.args and context.args[0].isdigit():
-        meme_id = int(context.args[0])
-
-    pool = await init_db()
-    async with pool.acquire() as conn:
-        if meme_id is not None:
-            row = await conn.fetchrow(
-                "SELECT id, owner_file_id, mime_type FROM memes WHERE posted=0 AND id=$1",
-                meme_id,
-            )
-            if not row:
-                await update.message.reply_text(f"No scheduled meme with ID {meme_id} to post.")
-                return
-        else:
-            row = await conn.fetchrow(
-                "SELECT id, owner_file_id, mime_type FROM memes WHERE posted=0 ORDER BY scheduled_ts ASC LIMIT 1"
-            )
-            if not row:
-                await update.message.reply_text("No scheduled memes to post.")
-                return
-    mid = row["id"]
-    file_id = row["owner_file_id"]
-    mime = row["mime_type"]
-    try:
-        if mime and mime.startswith("video"):
-            await context.bot.send_video(CHANNEL_ID, file_id)
-        else:
-            await context.bot.send_photo(CHANNEL_ID, file_id)
-        async with pool.acquire() as conn:
-            await conn.execute("UPDATE memes SET posted=1 WHERE id=$1", mid)
-        await update.message.reply_text(f"Posted meme with ID {mid} to channel.")
-    except Exception as e:
-        await update.message.reply_text(f"Failed to post meme: {e}")
-
-import re
-
-async def scheduleat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in OWNER_IDS:
-        await update.message.reply_text("Only the owner can use this command.")
-        return
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text("Usage: /scheduleat id: <id> <HH:MM> or /scheduleat ids: <start>-<end> <YYYY-MM-DD>")
-        return
-
-    argstr = ' '.join(context.args)
-    # Single ID mode: /scheduleat id: 6 16:20
-    m_single = re.match(r'id:\s*(\d+)\s+(\d{2}):(\d{2})$', argstr)
-    # Range mode: /scheduleat ids: 5-10 2025-10-19
-    m_range = re.match(r'ids:\s*(\d+)-(\d+)\s+(\d{4}-\d{2}-\d{2})$', argstr)
-
-    if m_single:
-        meme_id = int(m_single.group(1))
-        hour = int(m_single.group(2))
-        minute = int(m_single.group(3))
-        # Validate time
-        if not (0 <= hour < 24 and 0 <= minute < 60):
-            await update.message.reply_text("Invalid time format. Use 24h HH:MM.")
-            return
-        # Schedule meme at specified time today (IST)
-        now_ist = datetime.now(IST)
-        sched_dt = _ist_localize(datetime(now_ist.year, now_ist.month, now_ist.day, hour, minute))
-        sched_ts = int(sched_dt.timestamp())
-        pool = await init_db()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE memes SET scheduled_ts=$1 WHERE id=$2 AND posted=0",
-                sched_ts,
-                meme_id,
-            )
-        await update.message.reply_text(f"Rescheduled meme ID {meme_id} for {sched_dt.strftime('%Y-%m-%d %H:%M')} IST.")
-        return
-
-    elif m_range:
-        start_id = int(m_range.group(1))
-        end_id = int(m_range.group(2))
-        date_str = m_range.group(3)
-        from datetime import time as dtime
-        base_date = _ist_localize(datetime.strptime(date_str, '%Y-%m-%d'))
-        # Assign slots in order: 11:00, 16:00, 21:00, repeat
-        slot_times = [dtime(11,0), dtime(16,0), dtime(21,0)]
-        ids = list(range(start_id, end_id+1))
-        if not ids:
-            await update.message.reply_text("Invalid ID range.")
-            return
-        updates = []
-        for idx, meme_id in enumerate(ids):
-            slot = slot_times[idx % len(slot_times)]
-            sched_dt = base_date.replace(hour=slot.hour, minute=slot.minute, second=0, microsecond=0)
-            sched_ts = int(sched_dt.timestamp())
-            updates.append((sched_ts, meme_id))
-        pool = await init_db()
-        async with pool.acquire() as conn:
-            await conn.executemany(
-                "UPDATE memes SET scheduled_ts=$1 WHERE id=$2 AND posted=0",
-                updates,
-            )
-        await update.message.reply_text(f"Rescheduled memes IDs {start_id}-{end_id} for {date_str} in slots 11:00, 16:00, 21:00 IST (cycled).")
-        return
-
-    else:
-        await update.message.reply_text("Invalid format. Use /scheduleat id: <id> <HH:MM> or /scheduleat ids: <start>-<end> <YYYY-MM-DD>")
-
-def main():
+def main() -> None:
     if not BOT_TOKEN:
-        raise SystemExit("Please set TELEGRAM_BOT_TOKEN environment variable")
+        raise SystemExit("Please set TELEGRAM_BOT_TOKEN")
     if not OWNER_IDS or 0 in OWNER_IDS:
-        raise SystemExit("Please set OWNER_ID environment variable to your Telegram user id")
+        raise SystemExit("Please set OWNER_ID to your Telegram user ID")
     if not CHANNEL_ID:
-        raise SystemExit("Please set CHANNEL_ID to target channel (username or id)")
-    if not DATABASE_URL:
-        raise SystemExit("Please set DATABASE_URL (or MEMEBOT_DB) to a PostgreSQL connection string")
+        raise SystemExit("Please set CHANNEL_ID")
 
-    # Initialize DB first
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(init_db())
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    
-    app.add_handler(CommandHandler('start', start))
-    app.add_handler(CommandHandler('help', helpcmd))
-    app.add_handler(CommandHandler('postnow', postnow))
-    app.add_handler(CommandHandler('scheduled', scheduled))
-    app.add_handler(CommandHandler('unschedule', unschedule))
-    app.add_handler(CommandHandler('preview', preview))
-    app.add_handler(CommandHandler('log', logcmd))
-    app.add_handler(CommandHandler('backup', backup))
-    app.add_handler(CommandHandler('restore', restore))
-    app.add_handler(CommandHandler('scheduleat', scheduleat))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", helpcmd))
+    app.add_handler(CommandHandler("scheduled", scheduled))
+    app.add_handler(CommandHandler("preview", preview))
+    app.add_handler(CommandHandler("unschedule", unschedule))
+    app.add_handler(CommandHandler("postnow", postnow))
+    app.add_handler(CommandHandler("scheduleat", scheduleat))
+    app.add_handler(CommandHandler("backup", backup))
+    app.add_handler(CommandHandler("restore", restore))
+    app.add_handler(CommandHandler("database", database_menu))
+    app.add_handler(CommandHandler("db", database_menu))
+    app.add_handler(CommandHandler("storage", storage_status))
+    app.add_handler(CommandHandler("status", storage_status))
+    app.add_handler(CommandHandler("logs", logcmd))
+    app.add_handler(CommandHandler("log", logcmd))
+    app.add_handler(CallbackQueryHandler(on_callback))
+
     media_filter = filters.ChatType.PRIVATE & (filters.PHOTO | filters.VIDEO | filters.ANIMATION)
     app.add_handler(MessageHandler(media_filter, handle_media))
 
-    # run background poster using post_init hook
-    async def post_init(application):
+    async def post_init(application: Any) -> None:
         me = await application.bot.get_me()
         logger.info("Bot connected as @%s (id=%s)", me.username, me.id)
         asyncio.create_task(periodic_poster(application))
-    
-    app.post_init = post_init
 
+    app.post_init = post_init
     logger.info("Starting bot...")
     app.run_polling()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
